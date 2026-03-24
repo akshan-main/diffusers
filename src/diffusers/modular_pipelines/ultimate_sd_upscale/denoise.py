@@ -37,6 +37,7 @@ from ...image_processor import VaeImageProcessor
 from ...models import AutoencoderKL, UNet2DConditionModel
 from ...schedulers import EulerDiscreteScheduler
 from ...utils import logging
+from ...utils.torch_utils import randn_tensor
 from ..modular_pipeline import (
     BlockState,
     LoopSequentialPipelineBlocks,
@@ -47,6 +48,7 @@ from ..modular_pipeline_utils import ComponentSpec, ConfigSpec, InputParam, Outp
 from ..stable_diffusion_xl.before_denoise import (
     StableDiffusionXLImg2ImgPrepareAdditionalConditioningStep,
     StableDiffusionXLImg2ImgPrepareLatentsStep,
+    prepare_latents_img2img,
 )
 from ..stable_diffusion_xl.decoders import StableDiffusionXLDecodeStep
 from ..stable_diffusion_xl.denoise import StableDiffusionXLDenoiseStep
@@ -192,8 +194,6 @@ class UltimateSDUpscaleTilePrepareStep(ModularPipelineBlocks):
         # 0 denoising steps. Instead, reset the scheduler's mutable step index
         # so it can iterate the same schedule again for this tile.
         scheduler = components.scheduler
-        timesteps = block_state.timesteps
-        num_inference_steps = block_state.num_inference_steps
         latent_timestep = block_state.latent_timestep
 
         # Only reset _step_index (progress counter). Do NOT touch _begin_index —
@@ -207,6 +207,52 @@ class UltimateSDUpscaleTilePrepareStep(ModularPipelineBlocks):
             scheduler.is_scale_input_called = False
 
         # --- 4. Prepare latents ---
+        # Build clean init latents first (no random noise yet), then add tile noise.
+        # Using a global noise map keeps noise spatially consistent across tiles and
+        # greatly reduces cross-tile drift/artifacts.
+        clean_latents = prepare_latents_img2img(
+            components.vae,
+            components.scheduler,
+            image_latents,
+            latent_timestep,
+            block_state.batch_size,
+            block_state.num_images_per_prompt,
+            block_state.dtype,
+            image_latents.device,
+            generator=None,
+            add_noise=False,
+        )
+
+        latent_h, latent_w = clean_latents.shape[-2], clean_latents.shape[-1]
+        global_noise_map = getattr(block_state, "global_noise_map", None)
+        if global_noise_map is not None:
+            vae_scale_factor = int(getattr(block_state, "global_noise_scale", 8))
+            y0 = max(0, tile.crop_y // vae_scale_factor)
+            x0 = max(0, tile.crop_x // vae_scale_factor)
+            max_y0 = max(0, global_noise_map.shape[-2] - latent_h)
+            max_x0 = max(0, global_noise_map.shape[-1] - latent_w)
+            y0 = min(y0, max_y0)
+            x0 = min(x0, max_x0)
+            tile_noise = global_noise_map[:, :, y0 : y0 + latent_h, x0 : x0 + latent_w]
+
+            # Defensive fallback if latent shape and crop math ever diverge.
+            if tile_noise.shape != clean_latents.shape:
+                tile_noise = randn_tensor(
+                    clean_latents.shape,
+                    generator=block_state.generator,
+                    device=clean_latents.device,
+                    dtype=clean_latents.dtype,
+                )
+        else:
+            tile_noise = randn_tensor(
+                clean_latents.shape,
+                generator=block_state.generator,
+                device=clean_latents.device,
+                dtype=clean_latents.dtype,
+            )
+
+        pre_noised_latents = components.scheduler.add_noise(clean_latents, tile_noise, latent_timestep)
+
         lat_state = _make_state({
             "image_latents": image_latents,
             "latent_timestep": latent_timestep,
@@ -214,7 +260,7 @@ class UltimateSDUpscaleTilePrepareStep(ModularPipelineBlocks):
             "num_images_per_prompt": block_state.num_images_per_prompt,
             "dtype": block_state.dtype,
             "generator": block_state.generator,
-            "latents": None,
+            "latents": pre_noised_latents,
             "denoising_start": getattr(block_state, "denoising_start", None),
         })
         components, lat_state = self._prepare_latents(components, lat_state)
@@ -578,6 +624,21 @@ class UltimateSDUpscaleTileLoopStep(LoopSequentialPipelineBlocks):
 
         # Initialize canvas
         block_state.canvas = np.zeros((h, w, 3), dtype=np.float32)
+
+        # Prepare one global latent noise tensor and crop from it per tile.
+        # This keeps stochasticity consistent across tile boundaries.
+        vae_scale_factor = int(getattr(components.image_processor, "vae_scale_factor", 8))
+        latent_h = max(1, h // vae_scale_factor)
+        latent_w = max(1, w // vae_scale_factor)
+        effective_batch = block_state.batch_size * block_state.num_images_per_prompt
+        block_state.global_noise_map = randn_tensor(
+            (effective_batch, 4, latent_h, latent_w),
+            generator=getattr(block_state, "generator", None),
+            device=components._execution_device,
+            dtype=block_state.dtype,
+        )
+        block_state.global_noise_scale = vae_scale_factor
+
         if blend_mode == "gradient":
             block_state.weight_map = np.zeros((h, w), dtype=np.float32)
             block_state.blend_mode = blend_mode
