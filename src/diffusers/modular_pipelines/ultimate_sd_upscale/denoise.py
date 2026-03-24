@@ -52,7 +52,17 @@ from ..stable_diffusion_xl.before_denoise import (
 from ..stable_diffusion_xl.decoders import StableDiffusionXLDecodeStep
 from ..stable_diffusion_xl.denoise import StableDiffusionXLDenoiseStep
 from ..stable_diffusion_xl.encoders import StableDiffusionXLVaeEncoderStep
-from .utils_tiling import TileSpec, crop_tile, extract_core_from_decoded, paste_core_into_canvas
+from .utils_tiling import (
+    SeamFixSpec,
+    TileSpec,
+    crop_tile,
+    extract_band_from_decoded,
+    extract_core_from_decoded,
+    finalize_blended_canvas,
+    paste_core_into_canvas,
+    paste_core_into_canvas_blended,
+    paste_seam_fix_band,
+)
 
 
 logger = logging.get_logger(__name__)
@@ -341,8 +351,9 @@ class UltimateSDUpscaleTileDenoiserStep(ModularPipelineBlocks):
 class UltimateSDUpscaleTilePostProcessStep(ModularPipelineBlocks):
     """Loop sub-block that decodes one tile and pastes the core into the canvas.
 
-    Uses ``StableDiffusionXLDecodeStep`` for decoding, then extracts the core
-    region (excluding padding) and pastes it into the output canvas.
+    Supports two blending modes:
+    - ``"none"``: Non-overlapping core paste (fastest, default).
+    - ``"gradient"``: Gradient overlap blending for smoother tile transitions.
     """
 
     model_name = "stable-diffusion-xl"
@@ -355,7 +366,8 @@ class UltimateSDUpscaleTilePostProcessStep(ModularPipelineBlocks):
     def description(self) -> str:
         return (
             "Loop sub-block: decodes latents to an image via StableDiffusionXLDecodeStep, "
-            "then extracts the core region and pastes it into the output canvas."
+            "then extracts the core region and pastes it into the output canvas. "
+            "Supports 'none' and 'gradient' blending modes."
         )
 
     @property
@@ -382,7 +394,6 @@ class UltimateSDUpscaleTilePostProcessStep(ModularPipelineBlocks):
 
     @torch.no_grad()
     def __call__(self, components, block_state: BlockState, tile_idx: int, tile: TileSpec):
-        # Decode latents to numpy
         decode_state = _make_state({
             "latents": block_state.latents,
             "output_type": "np",
@@ -390,18 +401,28 @@ class UltimateSDUpscaleTilePostProcessStep(ModularPipelineBlocks):
         components, decode_state = self._decode(components, decode_state)
         decoded_images = decode_state.get("images")
 
-        # Take the first (and only) image
         decoded_np = decoded_images[0]  # shape: (crop_h, crop_w, 3)
 
-        # Resize if VAE output dimensions don't exactly match crop dimensions
         if decoded_np.shape[0] != tile.crop_h or decoded_np.shape[1] != tile.crop_w:
             pil_tile = PIL.Image.fromarray((np.clip(decoded_np, 0, 1) * 255).astype(np.uint8))
             pil_tile = pil_tile.resize((tile.crop_w, tile.crop_h), PIL.Image.LANCZOS)
             decoded_np = np.array(pil_tile).astype(np.float32) / 255.0
 
-        # Extract core and paste into canvas
         core = extract_core_from_decoded(decoded_np, tile)
-        paste_core_into_canvas(block_state.canvas, core, tile)
+
+        blend_mode = getattr(block_state, "blend_mode", "none")
+        if blend_mode == "gradient":
+            overlap = getattr(block_state, "gradient_blend_overlap", 0)
+            paste_core_into_canvas_blended(
+                block_state.canvas, block_state.weight_map, core, tile, overlap
+            )
+        elif blend_mode == "none":
+            paste_core_into_canvas(block_state.canvas, core, tile)
+        else:
+            raise ValueError(
+                f"Unsupported blend_mode '{blend_mode}'. "
+                "Supported modes: 'none', 'gradient'."
+            )
 
         return components, block_state
 
@@ -413,10 +434,10 @@ class UltimateSDUpscaleTilePostProcessStep(ModularPipelineBlocks):
 class UltimateSDUpscaleTileLoopStep(LoopSequentialPipelineBlocks):
     """Tile loop that iterates over the tile plan, running sub-blocks per tile.
 
-    Follows the same pattern as ``StableDiffusionXLDenoiseLoopWrapper``:
-    ``__call__`` iterates the loop and calls ``self.loop_step(...)`` per
-    iteration.  Sub-blocks receive ``(components, block_state, tile_idx, tile)``
-    and modify ``block_state`` in place.
+    Supports:
+    - Two blending modes: ``"none"`` (core paste) and ``"gradient"`` (overlap blending)
+    - Optional seam-fix pass: re-denoises narrow bands along tile boundaries
+      with feathered mask blending
 
     Sub-blocks:
         - ``UltimateSDUpscaleTilePrepareStep``    – crop, encode, prepare
@@ -437,6 +458,7 @@ class UltimateSDUpscaleTileLoopStep(LoopSequentialPipelineBlocks):
     def description(self) -> str:
         return (
             "Tile loop that iterates over the tile plan and runs sub-blocks per tile.\n"
+            "Supports 'none' and 'gradient' blending modes, plus optional seam-fix pass.\n"
             "Sub-blocks:\n"
             "  - UltimateSDUpscaleTilePrepareStep: crop, VAE encode, set timesteps, "
             "prepare latents, tile-aware add_cond\n"
@@ -454,6 +476,16 @@ class UltimateSDUpscaleTileLoopStep(LoopSequentialPipelineBlocks):
             InputParam("upscaled_width", type_hint=int, required=True),
             InputParam("tile_padding", type_hint=int, default=32),
             InputParam("output_type", type_hint=str, default="pil"),
+            InputParam("blend_mode", type_hint=str, default="none",
+                       description="Blending mode: 'none' (core paste) or 'gradient' (overlap blending)."),
+            InputParam("gradient_blend_overlap", type_hint=int, default=16,
+                       description="Width of gradient ramp in pixels for 'gradient' blend mode."),
+            InputParam("seam_fix_plan", type_hint=list, default=[],
+                       description="List of SeamFixSpec from tile planning. Empty disables seam fix."),
+            InputParam("seam_fix_mask_blur", type_hint=int, default=8,
+                       description="Feathering width for seam-fix band blending."),
+            InputParam("seam_fix_strength", type_hint=float, default=0.3,
+                       description="Denoise strength for seam-fix bands."),
         ]
 
     @property
@@ -461,6 +493,68 @@ class UltimateSDUpscaleTileLoopStep(LoopSequentialPipelineBlocks):
         return [
             OutputParam("images", type_hint=list, description="Final stitched output images."),
         ]
+
+    def _run_seam_fix_band(self, components, block_state, band: SeamFixSpec, band_idx: int):
+        """Re-denoise one seam-fix band and blend it into the canvas."""
+        # Crop the band region directly from the float canvas to avoid
+        # full-canvas uint8 quantization per band (quality + perf).
+        crop_region = np.clip(
+            block_state.canvas[band.crop_y:band.crop_y + band.crop_h,
+                               band.crop_x:band.crop_x + band.crop_w],
+            0, 1,
+        )
+        crop_uint8 = (crop_region * 255).astype(np.uint8)
+        band_crop_pil = PIL.Image.fromarray(crop_uint8)
+
+        # The PIL image is the crop region only, so the tile spec must use
+        # 0-based coordinates (the entire image IS the crop).
+        band_tile = TileSpec(
+            core_x=band.paste_x, core_y=band.paste_y,
+            core_w=band.band_w, core_h=band.band_h,
+            crop_x=0, crop_y=0,
+            crop_w=band.crop_w, crop_h=band.crop_h,
+            paste_x=band.paste_x, paste_y=band.paste_y,
+        )
+
+        # Store original upscaled_image and swap in the band crop
+        original_image = block_state.upscaled_image
+        block_state.upscaled_image = band_crop_pil
+
+        # Override strength for seam fix
+        original_strength = block_state.strength
+        block_state.strength = getattr(block_state, "seam_fix_strength", 0.3)
+
+        # Run prepare + denoise (reuse existing sub-blocks)
+        prepare_block = self.sub_blocks["tile_prepare"]
+        denoise_block = self.sub_blocks["tile_denoise"]
+
+        components, block_state = prepare_block(components, block_state, tile_idx=band_idx, tile=band_tile)
+        components, block_state = denoise_block(components, block_state, tile_idx=band_idx, tile=band_tile)
+
+        # Decode the band
+        decode_state = _make_state({
+            "latents": block_state.latents,
+            "output_type": "np",
+        })
+        decode_block = self.sub_blocks["tile_postprocess"]._decode
+        components, decode_state = decode_block(components, decode_state)
+        decoded_np = decode_state.get("images")[0]
+
+        if decoded_np.shape[0] != band.crop_h or decoded_np.shape[1] != band.crop_w:
+            pil_band = PIL.Image.fromarray((np.clip(decoded_np, 0, 1) * 255).astype(np.uint8))
+            pil_band = pil_band.resize((band.crop_w, band.crop_h), PIL.Image.LANCZOS)
+            decoded_np = np.array(pil_band).astype(np.float32) / 255.0
+
+        # Extract and paste band with feathered mask
+        band_pixels = extract_band_from_decoded(decoded_np, band)
+        seam_fix_mask_blur = getattr(block_state, "seam_fix_mask_blur", 8)
+        paste_seam_fix_band(block_state.canvas, band_pixels, band, seam_fix_mask_blur)
+
+        # Restore original values
+        block_state.upscaled_image = original_image
+        block_state.strength = original_strength
+
+        return components, block_state
 
     @torch.no_grad()
     def __call__(self, components, state: PipelineState) -> PipelineState:
@@ -470,20 +564,51 @@ class UltimateSDUpscaleTileLoopStep(LoopSequentialPipelineBlocks):
         h = block_state.upscaled_height
         w = block_state.upscaled_width
         output_type = block_state.output_type
+        blend_mode = getattr(block_state, "blend_mode", "none")
+        if blend_mode not in ("none", "gradient"):
+            raise ValueError(
+                f"Unsupported blend_mode '{blend_mode}'. Supported: 'none', 'gradient'."
+            )
 
-        # Initialize canvas (core paste, no blending needed)
+        # Initialize canvas
         block_state.canvas = np.zeros((h, w, 3), dtype=np.float32)
+        if blend_mode == "gradient":
+            block_state.weight_map = np.zeros((h, w), dtype=np.float32)
+            block_state.blend_mode = blend_mode
+            block_state.gradient_blend_overlap = getattr(block_state, "gradient_blend_overlap", 16)
 
         num_tiles = len(tile_plan)
-        logger.info(f"Processing {num_tiles} tiles")
+        seam_fix_plan = getattr(block_state, "seam_fix_plan", []) or []
+        total_steps = num_tiles + len(seam_fix_plan)
 
-        with self.progress_bar(total=num_tiles) as progress_bar:
+        logger.info(
+            f"Processing {num_tiles} tiles"
+            + (f" (blend_mode={blend_mode})" if blend_mode != "none" else "")
+            + (f" + {len(seam_fix_plan)} seam-fix bands" if seam_fix_plan else "")
+        )
+
+        with self.progress_bar(total=total_steps) as progress_bar:
+            # Main tile loop
             for i, tile in enumerate(tile_plan):
                 logger.debug(
                     f"Tile {i + 1}/{num_tiles}: core=({tile.core_x},{tile.core_y},{tile.core_w},{tile.core_h}) "
                     f"crop=({tile.crop_x},{tile.crop_y},{tile.crop_w},{tile.crop_h})"
                 )
                 components, block_state = self.loop_step(components, block_state, tile_idx=i, tile=tile)
+                progress_bar.update()
+
+            # Finalize gradient blending before seam fix
+            if blend_mode == "gradient":
+                block_state.canvas = finalize_blended_canvas(block_state.canvas, block_state.weight_map)
+
+            # Seam-fix pass
+            for j, band in enumerate(seam_fix_plan):
+                logger.debug(
+                    f"Seam-fix {j + 1}/{len(seam_fix_plan)}: "
+                    f"band=({band.band_x},{band.band_y},{band.band_w},{band.band_h}) "
+                    f"{band.orientation}"
+                )
+                components, block_state = self._run_seam_fix_band(components, block_state, band, j)
                 progress_bar.update()
 
         # Finalize output

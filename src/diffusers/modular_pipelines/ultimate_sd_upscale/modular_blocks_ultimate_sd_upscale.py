@@ -24,10 +24,14 @@ Inside ``tiled_img2img`` (tile loop), each tile runs:
 
     tile_prepare → tile_denoise → tile_postprocess
 
-The standard ``input`` and ``set_timesteps`` blocks run once (outside the
-loop) to establish shared batch/dtype/timestep defaults. The tile-prepare
-sub-block also performs a per-tile set-timesteps call to reset mutable
-scheduler step state safely before each denoise run.
+Followed by an optional seam-fix pass that re-denoises narrow bands along
+tile boundaries with feathered mask blending.
+
+Features:
+- Linear and chess (checkerboard) tile traversal
+- Non-overlapping core paste or gradient overlap blending
+- Optional seam-fix band re-denoise with configurable width and mask blur
+- Tile-aware SDXL micro-conditioning (crops_coords_top_left per tile)
 """
 
 from ...utils import logging
@@ -55,13 +59,13 @@ class UltimateSDUpscaleBlocks(SequentialPipelineBlocks):
         [2] tile_plan      – UltimateSDUpscaleTilePlanStep (new)
         [3] input          – StableDiffusionXLInputStep (reused)
         [4] set_timesteps  – StableDiffusionXLImg2ImgSetTimestepsStep (reused)
-        [5] tiled_img2img  – UltimateSDUpscaleTileLoopStep (new tile loop)
+        [5] tiled_img2img  – UltimateSDUpscaleTileLoopStep (tile loop + seam fix)
 
-    Pass 1 scope:
-        - SDXL only, Lanczos upscale, linear traversal
-        - Non-overlapping core paste (padded crop for denoise context only)
+    Features:
+        - Linear and chess (checkerboard) tile traversal
+        - Non-overlapping core paste or gradient overlap blending
+        - Seam-fix band re-denoise with feathered mask blending
         - Tile-aware SDXL conditioning (crops_coords_top_left per tile)
-        - No seam fixing yet
     """
 
     block_classes = [
@@ -91,7 +95,7 @@ class UltimateSDUpscaleBlocks(SequentialPipelineBlocks):
             "Modular pipeline for Ultimate SD Upscale using Stable Diffusion XL.\n"
             "Upscales an input image and refines it tile-by-tile using img2img "
             "denoising with configurable tile size, overlap padding, and strength.\n"
-            "Pass 1: Lanczos upscale, linear traversal, non-overlapping core paste."
+            "Supports linear/chess traversal, gradient blending, and seam-fix re-denoise."
         )
 
     @property
