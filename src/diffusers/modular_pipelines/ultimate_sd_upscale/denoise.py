@@ -153,6 +153,8 @@ class UltimateSDUpscaleTilePrepareStep(ModularPipelineBlocks):
             InputParam("pooled_prompt_embeds", type_hint=torch.Tensor, required=True),
             InputParam("num_inference_steps", type_hint=int, default=50),
             InputParam("strength", type_hint=float, default=0.3),
+            InputParam("timesteps", type_hint=torch.Tensor, required=True),
+            InputParam("latent_timestep", type_hint=torch.Tensor, required=True),
             InputParam("denoising_start"),
             InputParam("denoising_end"),
         ]
