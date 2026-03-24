@@ -47,7 +47,6 @@ from ..modular_pipeline_utils import ComponentSpec, ConfigSpec, InputParam, Outp
 from ..stable_diffusion_xl.before_denoise import (
     StableDiffusionXLImg2ImgPrepareAdditionalConditioningStep,
     StableDiffusionXLImg2ImgPrepareLatentsStep,
-    StableDiffusionXLImg2ImgSetTimestepsStep,
 )
 from ..stable_diffusion_xl.decoders import StableDiffusionXLDecodeStep
 from ..stable_diffusion_xl.denoise import StableDiffusionXLDenoiseStep
@@ -91,8 +90,9 @@ class UltimateSDUpscaleTilePrepareStep(ModularPipelineBlocks):
     For each tile it:
       1. Crops the padded region from the upscaled image.
       2. Calls ``StableDiffusionXLVaeEncoderStep`` to encode to latents.
-      3. Calls ``StableDiffusionXLImg2ImgSetTimestepsStep`` to reset scheduler
-         state for this tile.
+      3. Resets the scheduler step index (reuses timesteps from the outer
+         set_timesteps block — does NOT re-run set_timesteps to avoid
+         double-applying strength).
       4. Calls ``StableDiffusionXLImg2ImgPrepareLatentsStep``.
       5. Calls ``StableDiffusionXLImg2ImgPrepareAdditionalConditioningStep``
          with tile-aware ``crops_coords_top_left`` and ``target_size``.
@@ -106,7 +106,6 @@ class UltimateSDUpscaleTilePrepareStep(ModularPipelineBlocks):
         super().__init__()
         # Store SDXL blocks as attributes (NOT in sub_blocks → remains a leaf)
         self._vae_encoder = StableDiffusionXLVaeEncoderStep()
-        self._set_timesteps = StableDiffusionXLImg2ImgSetTimestepsStep()
         self._prepare_latents = StableDiffusionXLImg2ImgPrepareLatentsStep()
         self._prepare_add_cond = StableDiffusionXLImg2ImgPrepareAdditionalConditioningStep()
 
@@ -184,25 +183,27 @@ class UltimateSDUpscaleTilePrepareStep(ModularPipelineBlocks):
         components, enc_state = self._vae_encoder(components, enc_state)
         image_latents = enc_state.get("image_latents")
 
-        # --- 3. Reset tile timesteps/scheduler state ---
-        # Scheduler tracks internal step state during denoising, so each tile
-        # needs a fresh set_timesteps call.
-        set_state = _make_state({
-            "num_inference_steps": block_state.num_inference_steps,
-            "timesteps": None,
-            "sigmas": None,
-            "denoising_end": getattr(block_state, "denoising_end", None),
-            "strength": block_state.strength,
-            "denoising_start": getattr(block_state, "denoising_start", None),
-            "num_images_per_prompt": block_state.num_images_per_prompt,
-            "batch_size": block_state.batch_size,
-        })
-        components, set_state = self._set_timesteps(components, set_state)
+        # --- 3. Reset scheduler step state for this tile ---
+        # The outer set_timesteps block already computed the correct timesteps
+        # and num_inference_steps (with strength applied). We must NOT re-run
+        # set_timesteps here — that would double-apply strength and produce
+        # 0 denoising steps. Instead, reset the scheduler's mutable step index
+        # so it can iterate the same schedule again for this tile.
+        scheduler = components.scheduler
+        timesteps = block_state.timesteps
+        num_inference_steps = block_state.num_inference_steps
+        latent_timestep = block_state.latent_timestep
+
+        # Reset scheduler step tracking (set_begin_index resets _step_index)
+        if hasattr(scheduler, "set_begin_index"):
+            scheduler.set_begin_index(0)
+        if hasattr(scheduler, "_step_index"):
+            scheduler._step_index = None
 
         # --- 4. Prepare latents ---
         lat_state = _make_state({
             "image_latents": image_latents,
-            "latent_timestep": set_state.get("latent_timestep"),
+            "latent_timestep": latent_timestep,
             "batch_size": block_state.batch_size,
             "num_images_per_prompt": block_state.num_images_per_prompt,
             "dtype": block_state.dtype,
@@ -233,9 +234,8 @@ class UltimateSDUpscaleTilePrepareStep(ModularPipelineBlocks):
         components, cond_state = self._prepare_add_cond(components, cond_state)
 
         # --- Write results to block_state ---
-        block_state.timesteps = set_state.get("timesteps")
-        block_state.num_inference_steps = set_state.get("num_inference_steps")
-        block_state.latent_timestep = set_state.get("latent_timestep")
+        # timesteps/num_inference_steps/latent_timestep are from the outer
+        # set_timesteps step (already in block_state), no need to overwrite.
         block_state.latents = lat_state.get("latents")
         block_state.add_time_ids = cond_state.get("add_time_ids")
         block_state.negative_add_time_ids = cond_state.get("negative_add_time_ids")
