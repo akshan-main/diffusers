@@ -196,11 +196,15 @@ class UltimateSDUpscaleTilePrepareStep(ModularPipelineBlocks):
         num_inference_steps = block_state.num_inference_steps
         latent_timestep = block_state.latent_timestep
 
-        # Reset scheduler step tracking (set_begin_index resets _step_index)
-        if hasattr(scheduler, "set_begin_index"):
-            scheduler.set_begin_index(0)
+        # Only reset _step_index (progress counter). Do NOT touch _begin_index —
+        # it holds the correct start position computed by the outer set_timesteps
+        # step (e.g., step 14 for strength=0.3 with 20 steps). Resetting it to 0
+        # would make the scheduler use sigmas for full noise (timestep ~999) when
+        # the latents only have partial noise (timestep ~250), producing garbage.
         if hasattr(scheduler, "_step_index"):
             scheduler._step_index = None
+        if hasattr(scheduler, "is_scale_input_called"):
+            scheduler.is_scale_input_called = False
 
         # --- 4. Prepare latents ---
         lat_state = _make_state({
