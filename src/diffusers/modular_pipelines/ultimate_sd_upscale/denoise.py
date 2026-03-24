@@ -34,7 +34,7 @@ import torch
 from ...configuration_utils import FrozenDict
 from ...guiders import ClassifierFreeGuidance
 from ...image_processor import VaeImageProcessor
-from ...models import AutoencoderKL, UNet2DConditionModel
+from ...models import AutoencoderKL, ControlNetModel, UNet2DConditionModel
 from ...schedulers import EulerDiscreteScheduler
 from ...utils import logging
 from ...utils.torch_utils import randn_tensor
@@ -46,12 +46,13 @@ from ..modular_pipeline import (
 )
 from ..modular_pipeline_utils import ComponentSpec, ConfigSpec, InputParam, OutputParam
 from ..stable_diffusion_xl.before_denoise import (
+    StableDiffusionXLControlNetInputStep,
     StableDiffusionXLImg2ImgPrepareAdditionalConditioningStep,
     StableDiffusionXLImg2ImgPrepareLatentsStep,
     prepare_latents_img2img,
 )
 from ..stable_diffusion_xl.decoders import StableDiffusionXLDecodeStep
-from ..stable_diffusion_xl.denoise import StableDiffusionXLDenoiseStep
+from ..stable_diffusion_xl.denoise import StableDiffusionXLControlNetDenoiseStep, StableDiffusionXLDenoiseStep
 from ..stable_diffusion_xl.encoders import StableDiffusionXLVaeEncoderStep
 from .utils_tiling import (
     SeamFixSpec,
@@ -82,6 +83,57 @@ def _make_state(values: dict, kwargs_type_map: dict | None = None) -> PipelineSt
     return state
 
 
+def _to_pil_rgb_image(image) -> PIL.Image.Image:
+    """Convert a tensor/ndarray/PIL image to a RGB PIL image."""
+    if isinstance(image, PIL.Image.Image):
+        return image.convert("RGB")
+
+    if torch.is_tensor(image):
+        tensor = image.detach().cpu()
+        if tensor.ndim == 4:
+            if tensor.shape[0] != 1:
+                raise ValueError(
+                    f"`control_image` tensor batch must be 1 for tiled upscaling, got shape {tuple(tensor.shape)}."
+                )
+            tensor = tensor[0]
+        if tensor.ndim == 3 and tensor.shape[0] in (1, 3, 4) and tensor.shape[-1] not in (1, 3, 4):
+            tensor = tensor.permute(1, 2, 0)
+        image = tensor.numpy()
+
+    if isinstance(image, np.ndarray):
+        array = image
+        if array.ndim == 4:
+            if array.shape[0] != 1:
+                raise ValueError(
+                    f"`control_image` ndarray batch must be 1 for tiled upscaling, got shape {array.shape}."
+                )
+            array = array[0]
+        if array.ndim == 3 and array.shape[0] in (1, 3, 4) and array.shape[-1] not in (1, 3, 4):
+            array = np.transpose(array, (1, 2, 0))
+        if array.ndim == 2:
+            array = np.stack([array] * 3, axis=-1)
+        if array.ndim != 3:
+            raise ValueError(f"`control_image` must have 2 or 3 dimensions, got shape {array.shape}.")
+        if array.shape[-1] == 1:
+            array = np.repeat(array, 3, axis=-1)
+        if array.shape[-1] == 4:
+            array = array[..., :3]
+        if array.shape[-1] != 3:
+            raise ValueError(f"`control_image` channel dimension must be 1/3/4, got shape {array.shape}.")
+        if array.dtype != np.uint8:
+            array = np.asarray(array, dtype=np.float32)
+            max_val = float(np.max(array)) if array.size > 0 else 1.0
+            if max_val <= 1.0:
+                array = (np.clip(array, 0.0, 1.0) * 255.0).astype(np.uint8)
+            else:
+                array = np.clip(array, 0.0, 255.0).astype(np.uint8)
+        return PIL.Image.fromarray(array).convert("RGB")
+
+    raise ValueError(
+        f"Unsupported `control_image` type {type(image)}. Expected PIL.Image, torch.Tensor, or numpy.ndarray."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Loop sub-block 1: Prepare (crop + encode + timesteps + latents + add_cond)
 # ---------------------------------------------------------------------------
@@ -110,6 +162,7 @@ class UltimateSDUpscaleTilePrepareStep(ModularPipelineBlocks):
         self._vae_encoder = StableDiffusionXLVaeEncoderStep()
         self._prepare_latents = StableDiffusionXLImg2ImgPrepareLatentsStep()
         self._prepare_add_cond = StableDiffusionXLImg2ImgPrepareAdditionalConditioningStep()
+        self._prepare_controlnet = StableDiffusionXLControlNetInputStep()
 
     @property
     def description(self) -> str:
@@ -136,6 +189,12 @@ class UltimateSDUpscaleTilePrepareStep(ModularPipelineBlocks):
                 config=FrozenDict({"guidance_scale": 7.5}),
                 default_creation_method="from_config",
             ),
+            ComponentSpec(
+                "control_image_processor",
+                VaeImageProcessor,
+                config=FrozenDict({"do_convert_rgb": True, "do_normalize": False}),
+                default_creation_method="from_config",
+            ),
         ]
 
     @property
@@ -159,6 +218,12 @@ class UltimateSDUpscaleTilePrepareStep(ModularPipelineBlocks):
             InputParam("latent_timestep", type_hint=torch.Tensor, required=True),
             InputParam("denoising_start"),
             InputParam("denoising_end"),
+            InputParam("use_controlnet", type_hint=bool, default=False),
+            InputParam("control_image_processed"),
+            InputParam("control_guidance_start", default=0.0),
+            InputParam("control_guidance_end", default=1.0),
+            InputParam("controlnet_conditioning_scale", default=1.0),
+            InputParam("guess_mode", default=False),
         ]
 
     @property
@@ -168,6 +233,10 @@ class UltimateSDUpscaleTilePrepareStep(ModularPipelineBlocks):
             OutputParam("add_time_ids", type_hint=torch.Tensor, kwargs_type="denoiser_input_fields"),
             OutputParam("negative_add_time_ids", type_hint=torch.Tensor, kwargs_type="denoiser_input_fields"),
             OutputParam("timestep_cond", type_hint=torch.Tensor),
+            OutputParam("controlnet_cond", type_hint=torch.Tensor),
+            OutputParam("conditioning_scale"),
+            OutputParam("controlnet_keep", type_hint=list[float]),
+            OutputParam("guess_mode", type_hint=bool),
         ]
 
     @torch.no_grad()
@@ -292,6 +361,29 @@ class UltimateSDUpscaleTilePrepareStep(ModularPipelineBlocks):
         block_state.add_time_ids = cond_state.get("add_time_ids")
         block_state.negative_add_time_ids = cond_state.get("negative_add_time_ids")
         block_state.timestep_cond = cond_state.get("timestep_cond")
+        if getattr(block_state, "use_controlnet", False):
+            control_tile = crop_tile(block_state.control_image_processed, tile)
+            control_state = _make_state({
+                "control_image": control_tile,
+                "control_guidance_start": getattr(block_state, "control_guidance_start", 0.0),
+                "control_guidance_end": getattr(block_state, "control_guidance_end", 1.0),
+                "controlnet_conditioning_scale": getattr(block_state, "controlnet_conditioning_scale", 1.0),
+                "guess_mode": getattr(block_state, "guess_mode", False),
+                "num_images_per_prompt": block_state.num_images_per_prompt,
+                "latents": block_state.latents,
+                "batch_size": block_state.batch_size,
+                "timesteps": block_state.timesteps,
+                "crops_coords": None,
+            })
+            components, control_state = self._prepare_controlnet(components, control_state)
+            block_state.controlnet_cond = control_state.get("controlnet_cond")
+            block_state.conditioning_scale = control_state.get("conditioning_scale")
+            block_state.controlnet_keep = control_state.get("controlnet_keep")
+            block_state.guess_mode = control_state.get("guess_mode")
+        else:
+            block_state.controlnet_cond = None
+            block_state.conditioning_scale = None
+            block_state.controlnet_keep = None
 
         return components, block_state
 
@@ -313,12 +405,13 @@ class UltimateSDUpscaleTileDenoiserStep(ModularPipelineBlocks):
     def __init__(self):
         super().__init__()
         self._denoise = StableDiffusionXLDenoiseStep()
+        self._controlnet_denoise = StableDiffusionXLControlNetDenoiseStep()
 
     @property
     def description(self) -> str:
         return (
             "Loop sub-block: runs the SDXL denoising loop for one tile, "
-            "wrapping StableDiffusionXLDenoiseStep."
+            "with optional ControlNet conditioning."
         )
 
     @property
@@ -326,6 +419,7 @@ class UltimateSDUpscaleTileDenoiserStep(ModularPipelineBlocks):
         return [
             ComponentSpec("unet", UNet2DConditionModel),
             ComponentSpec("scheduler", EulerDiscreteScheduler),
+            ComponentSpec("controlnet", ControlNetModel),
             ComponentSpec(
                 "guider",
                 ClassifierFreeGuidance,
@@ -350,6 +444,11 @@ class UltimateSDUpscaleTileDenoiserStep(ModularPipelineBlocks):
             InputParam("timestep_cond", type_hint=torch.Tensor),
             InputParam("eta", type_hint=float, default=0.0),
             InputParam("generator"),
+            InputParam("use_controlnet", type_hint=bool, default=False),
+            InputParam("controlnet_cond", type_hint=torch.Tensor),
+            InputParam("conditioning_scale"),
+            InputParam("controlnet_keep", type_hint=list[float]),
+            InputParam("guess_mode", type_hint=bool, default=False),
         ]
 
     @property
@@ -388,9 +487,23 @@ class UltimateSDUpscaleTileDenoiserStep(ModularPipelineBlocks):
             "eta": getattr(block_state, "eta", 0.0),
             "generator": getattr(block_state, "generator", None),
         }
+        use_controlnet = bool(getattr(block_state, "use_controlnet", False))
+        if use_controlnet:
+            all_values.update(
+                {
+                    "controlnet_cond": block_state.controlnet_cond,
+                    "conditioning_scale": block_state.conditioning_scale,
+                    "guess_mode": getattr(block_state, "guess_mode", False),
+                    "controlnet_keep": block_state.controlnet_keep,
+                    "controlnet_kwargs": getattr(block_state, "controlnet_kwargs", {}),
+                }
+            )
 
         denoise_state = _make_state(all_values, kwargs_type_map)
-        components, denoise_state = self._denoise(components, denoise_state)
+        if use_controlnet:
+            components, denoise_state = self._controlnet_denoise(components, denoise_state)
+        else:
+            components, denoise_state = self._denoise(components, denoise_state)
 
         block_state.latents = denoise_state.get("latents")
         return components, block_state
@@ -538,6 +651,12 @@ class UltimateSDUpscaleTileLoopStep(LoopSequentialPipelineBlocks):
                        description="Feathering width for seam-fix band blending."),
             InputParam("seam_fix_strength", type_hint=float, default=0.3,
                        description="Denoise strength for seam-fix bands."),
+            InputParam("control_image",
+                       description="Optional ControlNet conditioning image. If provided, tile denoising uses ControlNet."),
+            InputParam("control_guidance_start", default=0.0),
+            InputParam("control_guidance_end", default=1.0),
+            InputParam("controlnet_conditioning_scale", default=1.0),
+            InputParam("guess_mode", default=False),
         ]
 
     @property
@@ -571,6 +690,11 @@ class UltimateSDUpscaleTileLoopStep(LoopSequentialPipelineBlocks):
         # Store original upscaled_image and swap in the band crop
         original_image = block_state.upscaled_image
         block_state.upscaled_image = band_crop_pil
+        original_control_image = getattr(block_state, "control_image_processed", None)
+        if getattr(block_state, "use_controlnet", False) and original_control_image is not None:
+            block_state.control_image_processed = original_control_image.crop(
+                (band.crop_x, band.crop_y, band.crop_x + band.crop_w, band.crop_y + band.crop_h)
+            )
 
         # Override strength for seam fix
         original_strength = block_state.strength
@@ -604,6 +728,8 @@ class UltimateSDUpscaleTileLoopStep(LoopSequentialPipelineBlocks):
 
         # Restore original values
         block_state.upscaled_image = original_image
+        if getattr(block_state, "use_controlnet", False):
+            block_state.control_image_processed = original_control_image
         block_state.strength = original_strength
 
         return components, block_state
@@ -621,6 +747,23 @@ class UltimateSDUpscaleTileLoopStep(LoopSequentialPipelineBlocks):
             raise ValueError(
                 f"Unsupported blend_mode '{blend_mode}'. Supported: 'none', 'gradient'."
             )
+
+        control_image = getattr(block_state, "control_image", None)
+        block_state.use_controlnet = control_image is not None
+        if block_state.use_controlnet:
+            if isinstance(control_image, list):
+                raise ValueError(
+                    "Ultimate SD Upscale currently supports a single `control_image`, not a list."
+                )
+            if not hasattr(components, "controlnet") or components.controlnet is None:
+                raise ValueError(
+                    "`control_image` was provided but `controlnet` component is missing. "
+                    "Load a ControlNet model (for example, a tile model) into `pipe.controlnet`."
+                )
+            block_state.control_image_processed = _to_pil_rgb_image(control_image)
+            if block_state.control_image_processed.size != (w, h):
+                block_state.control_image_processed = block_state.control_image_processed.resize((w, h), PIL.Image.LANCZOS)
+            logger.info("ControlNet conditioning enabled for tiled denoising.")
 
         # Initialize canvas
         block_state.canvas = np.zeros((h, w, 3), dtype=np.float32)

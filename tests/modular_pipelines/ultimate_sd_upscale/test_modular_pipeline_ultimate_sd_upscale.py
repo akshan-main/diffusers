@@ -26,9 +26,14 @@ Test categories:
 import unittest
 
 import numpy as np
+import torch
 from PIL import Image
 
-from diffusers.modular_pipelines.modular_pipeline import PipelineState
+from diffusers.modular_pipelines.modular_pipeline import BlockState, PipelineState
+from diffusers.modular_pipelines.ultimate_sd_upscale.denoise import (
+    UltimateSDUpscaleTileDenoiserStep,
+    _to_pil_rgb_image,
+)
 from diffusers.modular_pipelines.ultimate_sd_upscale.input import UltimateSDUpscaleTilePlanStep
 from diffusers.modular_pipelines.ultimate_sd_upscale.modular_blocks_ultimate_sd_upscale import (
     UltimateSDUpscaleBlocks,
@@ -548,6 +553,115 @@ class TestOutputSize(unittest.TestCase):
 
     def test_no_padding(self):
         self._check_coverage(1024, 1024, 512, 0)
+
+
+class TestControlNetSupport(unittest.TestCase):
+    def test_pipeline_inputs_include_controlnet(self):
+        blocks = UltimateSDUpscaleBlocks()
+        self.assertIn("control_image", blocks.input_names)
+        self.assertIn("controlnet_conditioning_scale", blocks.input_names)
+
+    def test_to_pil_rgb_image_from_chw_numpy(self):
+        chw = np.zeros((3, 16, 32), dtype=np.float32)
+        chw[0, :, :] = 1.0
+        pil_image = _to_pil_rgb_image(chw)
+        self.assertEqual(pil_image.mode, "RGB")
+        self.assertEqual(pil_image.size, (32, 16))
+
+    def test_to_pil_rgb_image_from_batched_tensor(self):
+        tensor = torch.zeros((1, 3, 10, 20), dtype=torch.float32)
+        tensor[:, 1, :, :] = 0.5
+        pil_image = _to_pil_rgb_image(tensor)
+        self.assertEqual(pil_image.mode, "RGB")
+        self.assertEqual(pil_image.size, (20, 10))
+
+    def test_tile_denoiser_selects_standard_path(self):
+        class DummyDenoise:
+            def __init__(self):
+                self.calls = 0
+
+            def __call__(self, components, state):
+                self.calls += 1
+                state.set("latents", state.get("latents"))
+                return components, state
+
+        step = UltimateSDUpscaleTileDenoiserStep()
+        standard = DummyDenoise()
+        controlnet = DummyDenoise()
+        step._denoise = standard
+        step._controlnet_denoise = controlnet
+
+        block_state = BlockState(
+            latents=torch.zeros((1, 4, 8, 8), dtype=torch.float32),
+            timesteps=torch.tensor([999], dtype=torch.float32),
+            num_inference_steps=1,
+            prompt_embeds=torch.zeros((1, 77, 16), dtype=torch.float32),
+            pooled_prompt_embeds=torch.zeros((1, 32), dtype=torch.float32),
+            add_time_ids=torch.zeros((1, 6), dtype=torch.float32),
+            use_controlnet=False,
+        )
+        dummy_tile = TileSpec(
+            core_x=0,
+            core_y=0,
+            core_w=8,
+            core_h=8,
+            crop_x=0,
+            crop_y=0,
+            crop_w=8,
+            crop_h=8,
+            paste_x=0,
+            paste_y=0,
+        )
+
+        step(None, block_state, tile_idx=0, tile=dummy_tile)
+        self.assertEqual(standard.calls, 1)
+        self.assertEqual(controlnet.calls, 0)
+
+    def test_tile_denoiser_selects_controlnet_path(self):
+        class DummyDenoise:
+            def __init__(self):
+                self.calls = 0
+
+            def __call__(self, components, state):
+                self.calls += 1
+                state.set("latents", state.get("latents"))
+                return components, state
+
+        step = UltimateSDUpscaleTileDenoiserStep()
+        standard = DummyDenoise()
+        controlnet = DummyDenoise()
+        step._denoise = standard
+        step._controlnet_denoise = controlnet
+
+        block_state = BlockState(
+            latents=torch.zeros((1, 4, 8, 8), dtype=torch.float32),
+            timesteps=torch.tensor([999], dtype=torch.float32),
+            num_inference_steps=1,
+            prompt_embeds=torch.zeros((1, 77, 16), dtype=torch.float32),
+            pooled_prompt_embeds=torch.zeros((1, 32), dtype=torch.float32),
+            add_time_ids=torch.zeros((1, 6), dtype=torch.float32),
+            use_controlnet=True,
+            controlnet_cond=torch.zeros((1, 3, 64, 64), dtype=torch.float32),
+            conditioning_scale=1.0,
+            controlnet_keep=[1.0],
+            guess_mode=False,
+        )
+        dummy_tile = TileSpec(
+            core_x=0,
+            core_y=0,
+            core_w=8,
+            core_h=8,
+            crop_x=0,
+            crop_y=0,
+            crop_w=8,
+            crop_h=8,
+            paste_x=0,
+            paste_y=0,
+        )
+
+        step(None, block_state, tile_idx=0, tile=dummy_tile)
+        self.assertEqual(standard.calls, 0)
+        self.assertEqual(controlnet.calls, 1)
 
 
 if __name__ == "__main__":

@@ -31,6 +31,7 @@ Features:
 - Linear and chess (checkerboard) tile traversal
 - Non-overlapping core paste or gradient overlap blending
 - Optional seam-fix band re-denoise with configurable width and mask blur
+- Optional ControlNet tile conditioning for stronger cross-tile structure consistency
 - Tile-aware SDXL micro-conditioning (crops_coords_top_left per tile)
 """
 
@@ -87,6 +88,7 @@ class UltimateSDUpscaleBlocks(SequentialPipelineBlocks):
 
     _workflow_map = {
         "upscale": {"image": True, "prompt": True},
+        "upscale_controlnet": {"image": True, "control_image": True, "prompt": True},
     }
 
     @property
@@ -95,7 +97,8 @@ class UltimateSDUpscaleBlocks(SequentialPipelineBlocks):
             "Modular pipeline for Ultimate SD Upscale using Stable Diffusion XL.\n"
             "Upscales an input image and refines it tile-by-tile using img2img "
             "denoising with configurable tile size, overlap padding, and strength.\n"
-            "Supports linear/chess traversal, gradient blending, and seam-fix re-denoise."
+            "Supports linear/chess traversal, gradient blending, seam-fix re-denoise, "
+            "and optional ControlNet tile conditioning."
         )
 
     @property
