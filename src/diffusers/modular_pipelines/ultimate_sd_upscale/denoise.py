@@ -1072,8 +1072,12 @@ class UltimateSDUpscaleMultiDiffusionStep(ModularPipelineBlocks):
             down_block_res_samples = None
             mid_block_res_sample = None
 
-            # ControlNet forward pass
-            if controlnet_cond_tile is not None and components.controlnet is not None:
+            # ControlNet forward pass (skip for unconditional batch where text_embeds is None)
+            if (
+                controlnet_cond_tile is not None
+                and components.controlnet is not None
+                and guider_state_batch.text_embeds is not None
+            ):
                 cn_added_cond = {
                     "text_embeds": guider_state_batch.text_embeds,
                     "time_ids": guider_state_batch.time_ids,
