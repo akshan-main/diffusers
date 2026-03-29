@@ -1227,10 +1227,12 @@ class UltimateSDUpscaleMultiDiffusionStep(ModularPipelineBlocks):
             tqdm(timesteps, total=block_state.num_inference_steps, desc="MultiDiffusion", **progress_kwargs)
         ):
             # Accumulators for noise prediction blending
-            noise_pred_accum = torch.zeros_like(latents)
+            # Use float32 accumulators for numerical stability; fp16 can underflow
+            # tiny overlap weights and produce NaNs in normalization.
+            noise_pred_accum = torch.zeros_like(latents, dtype=torch.float32)
             weight_accum = torch.zeros(
                 1, 1, latent_h, latent_w,
-                device=latents.device, dtype=latents.dtype,
+                device=latents.device, dtype=torch.float32,
             )
 
             for tile in tile_specs:
@@ -1254,17 +1256,19 @@ class UltimateSDUpscaleMultiDiffusionStep(ModularPipelineBlocks):
                 # Cosine weight for this tile
                 tile_weight = _make_cosine_tile_weight(
                     tile.h, tile.w, latent_overlap,
-                    latents.device, latents.dtype,
+                    latents.device, torch.float32,
                 )
 
                 # Accumulate
                 noise_pred_accum[:, :, tile.y:tile.y + tile.h, tile.x:tile.x + tile.w] += (
-                    tile_noise_pred * tile_weight
+                    tile_noise_pred.to(torch.float32) * tile_weight
                 )
                 weight_accum[:, :, tile.y:tile.y + tile.h, tile.x:tile.x + tile.w] += tile_weight
 
             # Normalize (MultiDiffusion weighted average)
-            blended_noise_pred = noise_pred_accum / weight_accum.clamp(min=1e-8)
+            blended_noise_pred = noise_pred_accum / weight_accum.clamp(min=1e-6)
+            blended_noise_pred = torch.nan_to_num(blended_noise_pred, nan=0.0, posinf=0.0, neginf=0.0)
+            blended_noise_pred = blended_noise_pred.to(latents.dtype)
 
             # Scheduler step on full latent
             latents_dtype = latents.dtype
