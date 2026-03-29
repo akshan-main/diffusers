@@ -660,6 +660,9 @@ class UltimateSDUpscaleTileLoopStep(LoopSequentialPipelineBlocks):
             InputParam("control_guidance_end", default=1.0),
             InputParam("controlnet_conditioning_scale", default=1.0),
             InputParam("guess_mode", default=False),
+            InputParam("guidance_scale", type_hint=float, default=7.5,
+                       description="Classifier-Free Guidance scale. Higher values produce images more aligned "
+                       "with the prompt at the expense of lower image quality."),
         ]
 
     @property
@@ -750,6 +753,10 @@ class UltimateSDUpscaleTileLoopStep(LoopSequentialPipelineBlocks):
             raise ValueError(
                 f"Unsupported blend_mode '{blend_mode}'. Supported: 'none', 'gradient'."
             )
+
+        # --- Configure guidance_scale on guider ---
+        guidance_scale = getattr(block_state, "guidance_scale", 7.5)
+        components.guider.guidance_scale = guidance_scale
 
         control_image = getattr(block_state, "control_image", None)
         block_state.use_controlnet = control_image is not None
@@ -992,11 +999,15 @@ class UltimateSDUpscaleMultiDiffusionStep(ModularPipelineBlocks):
             InputParam("add_time_ids", type_hint=torch.Tensor),
             InputParam("negative_add_time_ids", type_hint=torch.Tensor),
             InputParam("eta", type_hint=float, default=0.0),
+            # Guidance scale for CFG
+            InputParam("guidance_scale", type_hint=float, default=7.5,
+                       description="Classifier-Free Guidance scale. Higher values produce images more aligned "
+                       "with the prompt at the expense of lower image quality."),
             # MultiDiffusion params
             InputParam("latent_tile_size", type_hint=int, default=64,
                        description="Tile size in latent pixels (64 = 512px). For single pass, set >= latent dims."),
-            InputParam("latent_overlap", type_hint=int, default=8,
-                       description="Overlap in latent pixels (8 = 64px)."),
+            InputParam("latent_overlap", type_hint=int, default=16,
+                       description="Overlap in latent pixels (16 = 128px)."),
             # ControlNet params
             InputParam("control_image",
                        description="Optional ControlNet conditioning image."),
@@ -1219,6 +1230,10 @@ class UltimateSDUpscaleMultiDiffusionStep(ModularPipelineBlocks):
         tile_specs = plan_latent_tiles(latent_h, latent_w, latent_tile_size, latent_overlap)
         num_tiles = len(tile_specs)
         logger.info(f"MultiDiffusion: {num_tiles} latent tiles ({latent_h}x{latent_w}, tile={latent_tile_size}, overlap={latent_overlap})")
+
+        # --- Configure guidance_scale on guider ---
+        guidance_scale = getattr(block_state, "guidance_scale", 7.5)
+        components.guider.guidance_scale = guidance_scale
 
         # --- Guider setup ---
         disable_guidance = True if components.unet.config.time_cond_proj_dim is not None else False
