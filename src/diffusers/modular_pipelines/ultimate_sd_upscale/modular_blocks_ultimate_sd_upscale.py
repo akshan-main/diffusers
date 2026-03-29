@@ -95,10 +95,10 @@ class UltimateSDUpscaleBlocks(SequentialPipelineBlocks):
     def description(self):
         return (
             "Modular pipeline for Ultimate SD Upscale using Stable Diffusion XL.\n"
-            "Upscales an input image and refines it tile-by-tile using img2img "
-            "denoising with configurable tile size, overlap padding, and strength.\n"
-            "Supports linear/chess traversal, gradient blending, seam-fix re-denoise, "
-            "and optional ControlNet tile conditioning."
+            "Upscales an input image and refines it using img2img denoising.\n"
+            "Default: single-pass mode (tile_size=2048) — seamless, no tile artifacts.\n"
+            "For very large images: set tile_size=512 for tiled mode with optional "
+            "chess traversal, gradient blending, seam-fix, and ControlNet tile conditioning."
         )
 
     @property

@@ -765,6 +765,12 @@ class UltimateSDUpscaleTileLoopStep(LoopSequentialPipelineBlocks):
                 block_state.control_image_processed = block_state.control_image_processed.resize((w, h), PIL.Image.LANCZOS)
             logger.info("ControlNet conditioning enabled for tiled denoising.")
 
+        # Enable VAE tiling for memory-efficient encode/decode of large images.
+        # This lets the UNet process the full image (no tile seams) while the
+        # VAE handles memory via its own internal tiling.
+        if hasattr(components.vae, "enable_tiling"):
+            components.vae.enable_tiling()
+
         # Initialize canvas
         block_state.canvas = np.zeros((h, w, 3), dtype=np.float32)
 
