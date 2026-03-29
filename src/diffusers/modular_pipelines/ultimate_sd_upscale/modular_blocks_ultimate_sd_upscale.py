@@ -43,7 +43,7 @@ from ..stable_diffusion_xl.before_denoise import (
     StableDiffusionXLInputStep,
 )
 from ..stable_diffusion_xl.encoders import StableDiffusionXLTextEncoderStep
-from .denoise import UltimateSDUpscaleTileLoopStep
+from .denoise import UltimateSDUpscaleMultiDiffusionStep, UltimateSDUpscaleTileLoopStep
 from .input import UltimateSDUpscaleTilePlanStep, UltimateSDUpscaleUpscaleStep
 
 
@@ -99,6 +99,66 @@ class UltimateSDUpscaleBlocks(SequentialPipelineBlocks):
             "Default: single-pass mode (tile_size=2048) — seamless, no tile artifacts.\n"
             "For very large images: set tile_size=512 for tiled mode with optional "
             "chess traversal, gradient blending, seam-fix, and ControlNet tile conditioning."
+        )
+
+    @property
+    def outputs(self):
+        return [OutputParam.template("images")]
+
+
+class MultiDiffusionUpscaleBlocks(SequentialPipelineBlocks):
+    """Modular pipeline blocks for Ultimate SD Upscale with MultiDiffusion (SDXL).
+
+    Uses latent-space noise prediction blending across overlapping tiles for
+    **seamless** tiled upscaling at any resolution. This is the recommended
+    block set for high-quality upscaling.
+
+    Block graph::
+
+        [0] text_encoder     – StableDiffusionXLTextEncoderStep (reused)
+        [1] upscale          – UltimateSDUpscaleUpscaleStep (Lanczos resize)
+        [2] input            – StableDiffusionXLInputStep (reused)
+        [3] set_timesteps    – StableDiffusionXLImg2ImgSetTimestepsStep (reused)
+        [4] multidiffusion   – UltimateSDUpscaleMultiDiffusionStep (NEW)
+
+    The MultiDiffusion step handles VAE encode, tiled denoise with blending,
+    and VAE decode internally, using VAE tiling for memory efficiency.
+
+    Features:
+        - Seamless output at any resolution (no tile boundary artifacts)
+        - Optional ControlNet Tile conditioning
+        - Configurable latent tile size and overlap
+        - Single-pass for small images, tiled for large images
+    """
+
+    block_classes = [
+        StableDiffusionXLTextEncoderStep,
+        UltimateSDUpscaleUpscaleStep,
+        StableDiffusionXLInputStep,
+        StableDiffusionXLImg2ImgSetTimestepsStep,
+        UltimateSDUpscaleMultiDiffusionStep,
+    ]
+    block_names = [
+        "text_encoder",
+        "upscale",
+        "input",
+        "set_timesteps",
+        "multidiffusion",
+    ]
+
+    _workflow_map = {
+        "upscale": {"image": True, "prompt": True},
+        "upscale_controlnet": {"image": True, "control_image": True, "prompt": True},
+    }
+
+    @property
+    def description(self):
+        return (
+            "MultiDiffusion upscale pipeline for Stable Diffusion XL.\n"
+            "Upscales an input image and refines it using tiled denoising with "
+            "latent-space noise prediction blending. Produces seamless output at "
+            "any resolution without tile-boundary artifacts.\n"
+            "Supports optional ControlNet Tile conditioning for improved fidelity."
         )
 
     @property

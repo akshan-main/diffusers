@@ -55,6 +55,7 @@ from ..stable_diffusion_xl.decoders import StableDiffusionXLDecodeStep
 from ..stable_diffusion_xl.denoise import StableDiffusionXLControlNetDenoiseStep, StableDiffusionXLDenoiseStep
 from ..stable_diffusion_xl.encoders import StableDiffusionXLVaeEncoderStep
 from .utils_tiling import (
+    LatentTileSpec,
     SeamFixSpec,
     TileSpec,
     crop_tile,
@@ -64,6 +65,7 @@ from .utils_tiling import (
     paste_core_into_canvas,
     paste_core_into_canvas_blended,
     paste_seam_fix_band,
+    plan_latent_tiles,
 )
 
 
@@ -837,6 +839,454 @@ class UltimateSDUpscaleTileLoopStep(LoopSequentialPipelineBlocks):
             block_state.images = [result]
         elif output_type == "pt":
             block_state.images = [torch.from_numpy(result).permute(2, 0, 1).unsqueeze(0)]
+        else:
+            block_state.images = [PIL.Image.fromarray(result_uint8)]
+
+        self.set_block_state(state, block_state)
+        return components, state
+
+
+# =============================================================================
+# MultiDiffusion: latent-space noise prediction blending
+# =============================================================================
+
+
+def _make_cosine_tile_weight(h: int, w: int, overlap: int, device, dtype) -> torch.Tensor:
+    """Create a 2D cosine-ramp weight tensor for MultiDiffusion blending.
+
+    Weight is 1.0 in the center and smoothly fades to ~0 at tile edges via a
+    raised-cosine (Hann) window in the overlap regions.
+
+    Args:
+        h: Tile height in latent pixels.
+        w: Tile width in latent pixels.
+        overlap: Overlap in latent pixels.
+        device: Torch device.
+        dtype: Torch dtype.
+
+    Returns:
+        Tensor of shape ``(1, 1, h, w)`` for broadcasting.
+    """
+    import math
+
+    def _ramp(length, overlap_size):
+        ramp = torch.ones(length, device=device, dtype=dtype)
+        if overlap_size > 0 and length > 2 * overlap_size:
+            fade = 0.5 * (1.0 - torch.cos(torch.linspace(0, math.pi, overlap_size, device=device, dtype=dtype)))
+            ramp[:overlap_size] = fade
+            ramp[-overlap_size:] = fade.flip(0)
+        return ramp
+
+    w_h = _ramp(h, overlap)
+    w_w = _ramp(w, overlap)
+    return (w_h[:, None] * w_w[None, :]).unsqueeze(0).unsqueeze(0)
+
+
+class UltimateSDUpscaleMultiDiffusionStep(ModularPipelineBlocks):
+    """Single block that encodes, denoises with MultiDiffusion, and decodes.
+
+    MultiDiffusion inverts the standard tile loop: the **outer** loop iterates
+    over timesteps and the **inner** loop iterates over overlapping latent
+    tiles. At each timestep, per-tile noise predictions are blended with
+    cosine-ramp overlap weights, then a single scheduler step is applied to
+    the full latent tensor. This eliminates tile-boundary artifacts because
+    blending happens in noise-prediction space, not pixel space.
+
+    The full flow:
+        1. Enable VAE tiling for memory-efficient encode/decode.
+        2. VAE-encode the upscaled image to full-resolution latents.
+        3. Add noise at the strength-determined level.
+        4. For each timestep:
+            a. Plan overlapping tiles in latent space.
+            b. For each tile: crop latents, run UNet (+ optional ControlNet)
+               through the guider for CFG, accumulate weighted noise predictions.
+            c. Normalize predictions by accumulated weights.
+            d. One ``scheduler.step`` on the full blended prediction.
+        5. VAE-decode the final latents.
+    """
+
+    model_name = "stable-diffusion-xl"
+
+    def __init__(self):
+        super().__init__()
+        self._vae_encoder = StableDiffusionXLVaeEncoderStep()
+        self._prepare_latents = StableDiffusionXLImg2ImgPrepareLatentsStep()
+        self._prepare_add_cond = StableDiffusionXLImg2ImgPrepareAdditionalConditioningStep()
+        self._prepare_controlnet = StableDiffusionXLControlNetInputStep()
+        self._decode = StableDiffusionXLDecodeStep()
+
+    @property
+    def description(self) -> str:
+        return (
+            "MultiDiffusion tiled denoising: encodes the full upscaled image, "
+            "denoises with latent-space noise-prediction blending across "
+            "overlapping tiles, then decodes. Produces seamless output at any "
+            "resolution without tile-boundary artifacts."
+        )
+
+    @property
+    def expected_components(self) -> list[ComponentSpec]:
+        return [
+            ComponentSpec("vae", AutoencoderKL),
+            ComponentSpec(
+                "image_processor",
+                VaeImageProcessor,
+                config=FrozenDict({"vae_scale_factor": 8}),
+                default_creation_method="from_config",
+            ),
+            ComponentSpec(
+                "control_image_processor",
+                VaeImageProcessor,
+                config=FrozenDict({"do_convert_rgb": True, "do_normalize": False}),
+                default_creation_method="from_config",
+            ),
+            ComponentSpec("scheduler", EulerDiscreteScheduler),
+            ComponentSpec("unet", UNet2DConditionModel),
+            ComponentSpec("controlnet", ControlNetModel),
+            ComponentSpec(
+                "guider",
+                ClassifierFreeGuidance,
+                config=FrozenDict({"guidance_scale": 7.5}),
+                default_creation_method="from_config",
+            ),
+        ]
+
+    @property
+    def expected_configs(self) -> list[ConfigSpec]:
+        return [ConfigSpec("requires_aesthetics_score", False)]
+
+    @property
+    def inputs(self) -> list[InputParam]:
+        return [
+            InputParam("upscaled_image", type_hint=PIL.Image.Image, required=True),
+            InputParam("upscaled_height", type_hint=int, required=True),
+            InputParam("upscaled_width", type_hint=int, required=True),
+            InputParam("generator"),
+            InputParam("batch_size", type_hint=int, required=True),
+            InputParam("num_images_per_prompt", type_hint=int, default=1),
+            InputParam("dtype", type_hint=torch.dtype, required=True),
+            InputParam("pooled_prompt_embeds", type_hint=torch.Tensor, required=True),
+            InputParam("num_inference_steps", type_hint=int, default=50),
+            InputParam("strength", type_hint=float, default=0.3),
+            InputParam("timesteps", type_hint=torch.Tensor, required=True),
+            InputParam("latent_timestep", type_hint=torch.Tensor, required=True),
+            InputParam("denoising_start"),
+            InputParam("denoising_end"),
+            InputParam("output_type", type_hint=str, default="pil"),
+            # Prompt embeddings for guider
+            InputParam("prompt_embeds", type_hint=torch.Tensor, required=True),
+            InputParam("negative_prompt_embeds", type_hint=torch.Tensor),
+            InputParam("negative_pooled_prompt_embeds", type_hint=torch.Tensor),
+            InputParam("add_time_ids", type_hint=torch.Tensor),
+            InputParam("negative_add_time_ids", type_hint=torch.Tensor),
+            InputParam("eta", type_hint=float, default=0.0),
+            # MultiDiffusion params
+            InputParam("latent_tile_size", type_hint=int, default=64,
+                       description="Tile size in latent pixels (64 = 512px). For single pass, set >= latent dims."),
+            InputParam("latent_overlap", type_hint=int, default=8,
+                       description="Overlap in latent pixels (8 = 64px)."),
+            # ControlNet params
+            InputParam("control_image",
+                       description="Optional ControlNet conditioning image."),
+            InputParam("control_guidance_start", default=0.0),
+            InputParam("control_guidance_end", default=1.0),
+            InputParam("controlnet_conditioning_scale", default=1.0),
+            InputParam("guess_mode", default=False),
+        ]
+
+    @property
+    def intermediate_outputs(self) -> list[OutputParam]:
+        return [
+            OutputParam("images", type_hint=list, description="Final upscaled output images."),
+        ]
+
+    def _run_tile_unet(
+        self,
+        components,
+        tile_latents: torch.Tensor,
+        t: int,
+        i: int,
+        block_state,
+        controlnet_cond_tile=None,
+    ) -> torch.Tensor:
+        """Run guider + UNet (+ optional ControlNet) on one tile, return noise_pred."""
+        import inspect
+
+        # Scale input
+        scaled_latents = components.scheduler.scale_model_input(tile_latents, t)
+
+        # Guider inputs
+        guider_inputs = {
+            "prompt_embeds": (
+                getattr(block_state, "prompt_embeds", None),
+                getattr(block_state, "negative_prompt_embeds", None),
+            ),
+            "time_ids": (
+                getattr(block_state, "add_time_ids", None),
+                getattr(block_state, "negative_add_time_ids", None),
+            ),
+            "text_embeds": (
+                getattr(block_state, "pooled_prompt_embeds", None),
+                getattr(block_state, "negative_pooled_prompt_embeds", None),
+            ),
+        }
+
+        components.guider.set_state(
+            step=i,
+            num_inference_steps=block_state.num_inference_steps,
+            timestep=t,
+        )
+        guider_state = components.guider.prepare_inputs(guider_inputs)
+
+        for guider_state_batch in guider_state:
+            components.guider.prepare_models(components.unet)
+
+            added_cond_kwargs = {
+                "text_embeds": guider_state_batch.text_embeds,
+                "time_ids": guider_state_batch.time_ids,
+            }
+
+            down_block_res_samples = None
+            mid_block_res_sample = None
+
+            # ControlNet forward pass
+            if controlnet_cond_tile is not None and components.controlnet is not None:
+                cn_added_cond = {
+                    "text_embeds": guider_state_batch.text_embeds,
+                    "time_ids": guider_state_batch.time_ids,
+                }
+                cond_scale = block_state._cn_cond_scale
+                if isinstance(block_state._cn_controlnet_keep, list) and i < len(block_state._cn_controlnet_keep):
+                    keep_val = block_state._cn_controlnet_keep[i]
+                else:
+                    keep_val = 1.0
+                if isinstance(cond_scale, list):
+                    cond_scale = [c * keep_val for c in cond_scale]
+                else:
+                    cond_scale = cond_scale * keep_val
+
+                guess_mode = getattr(block_state, "guess_mode", False)
+                if guess_mode and not components.guider.is_conditional:
+                    down_block_res_samples = [torch.zeros_like(s) for s in block_state._cn_zeros_down] if hasattr(block_state, "_cn_zeros_down") else None
+                    mid_block_res_sample = torch.zeros_like(block_state._cn_zeros_mid) if hasattr(block_state, "_cn_zeros_mid") else None
+                else:
+                    down_block_res_samples, mid_block_res_sample = components.controlnet(
+                        scaled_latents,
+                        t,
+                        encoder_hidden_states=guider_state_batch.prompt_embeds,
+                        controlnet_cond=controlnet_cond_tile,
+                        conditioning_scale=cond_scale,
+                        guess_mode=guess_mode,
+                        added_cond_kwargs=cn_added_cond,
+                        return_dict=False,
+                    )
+                    if not hasattr(block_state, "_cn_zeros_down"):
+                        block_state._cn_zeros_down = [torch.zeros_like(d) for d in down_block_res_samples]
+                        block_state._cn_zeros_mid = torch.zeros_like(mid_block_res_sample)
+
+            unet_kwargs = {
+                "sample": scaled_latents,
+                "timestep": t,
+                "encoder_hidden_states": guider_state_batch.prompt_embeds,
+                "added_cond_kwargs": added_cond_kwargs,
+                "return_dict": False,
+            }
+            if down_block_res_samples is not None:
+                unet_kwargs["down_block_additional_residuals"] = down_block_res_samples
+                unet_kwargs["mid_block_additional_residual"] = mid_block_res_sample
+
+            guider_state_batch.noise_pred = components.unet(**unet_kwargs)[0]
+            components.guider.cleanup_models(components.unet)
+
+        noise_pred = components.guider(guider_state)[0]
+        return noise_pred
+
+    @torch.no_grad()
+    def __call__(self, components, state: PipelineState) -> PipelineState:
+        block_state = self.get_block_state(state)
+
+        h = block_state.upscaled_height
+        w = block_state.upscaled_width
+        output_type = block_state.output_type
+        latent_tile_size = block_state.latent_tile_size
+        latent_overlap = block_state.latent_overlap
+
+        # --- Enable VAE tiling ---
+        if hasattr(components.vae, "enable_tiling"):
+            components.vae.enable_tiling()
+
+        # --- ControlNet setup ---
+        control_image = getattr(block_state, "control_image", None)
+        use_controlnet = control_image is not None and hasattr(components, "controlnet") and components.controlnet is not None
+        full_controlnet_cond = None
+
+        if use_controlnet:
+            ctrl_pil = _to_pil_rgb_image(control_image)
+            if ctrl_pil.size != (w, h):
+                ctrl_pil = ctrl_pil.resize((w, h), PIL.Image.LANCZOS)
+            # Prepare full controlnet cond tensor
+            ctrl_state = _make_state({
+                "control_image": ctrl_pil,
+                "control_guidance_start": getattr(block_state, "control_guidance_start", 0.0),
+                "control_guidance_end": getattr(block_state, "control_guidance_end", 1.0),
+                "controlnet_conditioning_scale": getattr(block_state, "controlnet_conditioning_scale", 1.0),
+                "guess_mode": getattr(block_state, "guess_mode", False),
+                "num_images_per_prompt": block_state.num_images_per_prompt,
+                "latents": torch.zeros(1),  # placeholder, needed for shape
+                "batch_size": block_state.batch_size,
+                "timesteps": block_state.timesteps,
+                "crops_coords": None,
+            })
+            components, ctrl_state = self._prepare_controlnet(components, ctrl_state)
+            full_controlnet_cond = ctrl_state.get("controlnet_cond")
+            block_state._cn_cond_scale = ctrl_state.get("conditioning_scale")
+            block_state._cn_controlnet_keep = ctrl_state.get("controlnet_keep")
+            logger.info("MultiDiffusion: ControlNet enabled.")
+
+        # --- VAE encode full upscaled image ---
+        enc_state = _make_state({
+            "image": block_state.upscaled_image,
+            "height": h,
+            "width": w,
+            "generator": block_state.generator,
+            "dtype": block_state.dtype,
+            "preprocess_kwargs": None,
+        })
+        components, enc_state = self._vae_encoder(components, enc_state)
+        image_latents = enc_state.get("image_latents")
+
+        # --- Prepare latents (add noise) ---
+        latent_timestep = block_state.latent_timestep
+        lat_state = _make_state({
+            "image_latents": image_latents,
+            "latent_timestep": latent_timestep,
+            "batch_size": block_state.batch_size,
+            "num_images_per_prompt": block_state.num_images_per_prompt,
+            "dtype": block_state.dtype,
+            "generator": block_state.generator,
+            "latents": None,
+            "denoising_start": getattr(block_state, "denoising_start", None),
+        })
+        components, lat_state = self._prepare_latents(components, lat_state)
+        latents = lat_state.get("latents")
+
+        # --- Prepare additional conditioning ---
+        cond_state = _make_state({
+            "original_size": (h, w),
+            "target_size": (h, w),
+            "crops_coords_top_left": (0, 0),
+            "negative_original_size": None,
+            "negative_target_size": None,
+            "negative_crops_coords_top_left": (0, 0),
+            "num_images_per_prompt": block_state.num_images_per_prompt,
+            "aesthetic_score": 6.0,
+            "negative_aesthetic_score": 2.0,
+            "latents": latents,
+            "pooled_prompt_embeds": block_state.pooled_prompt_embeds,
+            "batch_size": block_state.batch_size,
+        })
+        components, cond_state = self._prepare_add_cond(components, cond_state)
+        block_state.add_time_ids = cond_state.get("add_time_ids")
+        block_state.negative_add_time_ids = cond_state.get("negative_add_time_ids")
+
+        # --- Plan latent tiles ---
+        latent_h, latent_w = latents.shape[-2], latents.shape[-1]
+        tile_specs = plan_latent_tiles(latent_h, latent_w, latent_tile_size, latent_overlap)
+        num_tiles = len(tile_specs)
+        logger.info(f"MultiDiffusion: {num_tiles} latent tiles ({latent_h}x{latent_w}, tile={latent_tile_size}, overlap={latent_overlap})")
+
+        # --- Guider setup ---
+        disable_guidance = True if components.unet.config.time_cond_proj_dim is not None else False
+        if disable_guidance:
+            components.guider.disable()
+        else:
+            components.guider.enable()
+
+        # --- MultiDiffusion denoise loop ---
+        timesteps = block_state.timesteps
+        vae_scale_factor = int(getattr(components.image_processor, "vae_scale_factor", 8))
+
+        num_warmup_steps = max(len(timesteps) - block_state.num_inference_steps * components.scheduler.order, 0)
+
+        with self.progress_bar(total=block_state.num_inference_steps) as progress_bar:
+            for i, t in enumerate(timesteps):
+                # Accumulators for noise prediction blending
+                noise_pred_accum = torch.zeros_like(latents)
+                weight_accum = torch.zeros(
+                    1, 1, latent_h, latent_w,
+                    device=latents.device, dtype=latents.dtype,
+                )
+
+                for tile in tile_specs:
+                    # Crop tile from full latents
+                    tile_latents = latents[:, :, tile.y:tile.y + tile.h, tile.x:tile.x + tile.w].clone()
+
+                    # Crop ControlNet cond for this tile (pixel space)
+                    cn_tile = None
+                    if use_controlnet and full_controlnet_cond is not None:
+                        py = tile.y * vae_scale_factor
+                        px = tile.x * vae_scale_factor
+                        ph = tile.h * vae_scale_factor
+                        pw = tile.w * vae_scale_factor
+                        cn_tile = full_controlnet_cond[:, :, py:py + ph, px:px + pw]
+
+                    # Run UNet (+ ControlNet + guider) on this tile
+                    tile_noise_pred = self._run_tile_unet(
+                        components, tile_latents, t, i, block_state, cn_tile,
+                    )
+
+                    # Cosine weight for this tile
+                    tile_weight = _make_cosine_tile_weight(
+                        tile.h, tile.w, latent_overlap,
+                        latents.device, latents.dtype,
+                    )
+
+                    # Accumulate
+                    noise_pred_accum[:, :, tile.y:tile.y + tile.h, tile.x:tile.x + tile.w] += (
+                        tile_noise_pred * tile_weight
+                    )
+                    weight_accum[:, :, tile.y:tile.y + tile.h, tile.x:tile.x + tile.w] += tile_weight
+
+                # Normalize (MultiDiffusion weighted average)
+                blended_noise_pred = noise_pred_accum / weight_accum.clamp(min=1e-8)
+
+                # Scheduler step on full latent
+                latents_dtype = latents.dtype
+                latents = components.scheduler.step(
+                    blended_noise_pred, t, latents,
+                    return_dict=False,
+                )[0]
+                if latents.dtype != latents_dtype and torch.backends.mps.is_available():
+                    latents = latents.to(latents_dtype)
+
+                if i == len(timesteps) - 1 or (
+                    (i + 1) > num_warmup_steps and (i + 1) % components.scheduler.order == 0
+                ):
+                    progress_bar.update()
+
+        # --- Decode ---
+        decode_state = _make_state({
+            "latents": latents,
+            "output_type": "np",
+        })
+        components, decode_state = self._decode(components, decode_state)
+        decoded_images = decode_state.get("images")
+        decoded_np = decoded_images[0]
+
+        # Resize if VAE output doesn't exactly match target
+        if decoded_np.shape[0] != h or decoded_np.shape[1] != w:
+            pil_out = PIL.Image.fromarray((np.clip(decoded_np, 0, 1) * 255).astype(np.uint8))
+            pil_out = pil_out.resize((w, h), PIL.Image.LANCZOS)
+            decoded_np = np.array(pil_out).astype(np.float32) / 255.0
+
+        # Format output
+        result_uint8 = (np.clip(decoded_np, 0, 1) * 255).astype(np.uint8)
+        if output_type == "pil":
+            block_state.images = [PIL.Image.fromarray(result_uint8)]
+        elif output_type == "np":
+            block_state.images = [decoded_np]
+        elif output_type == "pt":
+            block_state.images = [torch.from_numpy(decoded_np).permute(2, 0, 1).unsqueeze(0)]
         else:
             block_state.images = [PIL.Image.fromarray(result_uint8)]
 

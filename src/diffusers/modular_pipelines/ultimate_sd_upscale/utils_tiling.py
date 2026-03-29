@@ -571,3 +571,86 @@ def paste_seam_fix_band(
 
     existing = canvas[y1:y2, x1:x2]
     canvas[y1:y2, x1:x2] = existing * (1 - mask[:, :, np.newaxis]) + band_image * mask[:, :, np.newaxis]
+
+
+# =============================================================================
+# Latent-space tile planning for MultiDiffusion
+# =============================================================================
+
+
+@dataclass
+class LatentTileSpec:
+    """Tile specification in latent space for MultiDiffusion.
+
+    Attributes:
+        y: Top edge in latent pixels.
+        x: Left edge in latent pixels.
+        h: Height in latent pixels.
+        w: Width in latent pixels.
+    """
+
+    y: int
+    x: int
+    h: int
+    w: int
+
+
+def plan_latent_tiles(
+    latent_h: int,
+    latent_w: int,
+    tile_size: int = 64,
+    overlap: int = 8,
+) -> list[LatentTileSpec]:
+    """Plan overlapping tiles in latent space for MultiDiffusion.
+
+    Tiles overlap by ``overlap`` latent pixels. The stride is
+    ``tile_size - overlap``. Edge tiles are clamped to the latent bounds.
+
+    Args:
+        latent_h: Height of the full latent tensor.
+        latent_w: Width of the full latent tensor.
+        tile_size: Tile size in latent pixels (e.g., 64 = 512px at scale 8).
+        overlap: Overlap in latent pixels (e.g., 8 = 64px at scale 8).
+
+    Returns:
+        List of ``LatentTileSpec``.
+    """
+    if tile_size <= 0:
+        raise ValueError(f"`tile_size` must be positive, got {tile_size}.")
+    if overlap < 0:
+        raise ValueError(f"`overlap` must be non-negative, got {overlap}.")
+    if overlap >= tile_size:
+        raise ValueError(
+            f"`overlap` must be less than `tile_size`. "
+            f"Got overlap={overlap}, tile_size={tile_size}."
+        )
+
+    stride = tile_size - overlap
+    tiles: list[LatentTileSpec] = []
+
+    y = 0
+    while y < latent_h:
+        h = min(tile_size, latent_h - y)
+        # If remaining height is less than tile_size, shift back to get a full tile
+        if h < tile_size and y > 0:
+            y = max(0, latent_h - tile_size)
+            h = latent_h - y
+
+        x = 0
+        while x < latent_w:
+            w = min(tile_size, latent_w - x)
+            if w < tile_size and x > 0:
+                x = max(0, latent_w - tile_size)
+                w = latent_w - x
+
+            tiles.append(LatentTileSpec(y=y, x=x, h=h, w=w))
+
+            if x + w >= latent_w:
+                break
+            x += stride
+
+        if y + h >= latent_h:
+            break
+        y += stride
+
+    return tiles

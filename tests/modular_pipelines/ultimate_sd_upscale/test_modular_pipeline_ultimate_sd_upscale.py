@@ -36,9 +36,11 @@ from diffusers.modular_pipelines.ultimate_sd_upscale.denoise import (
 )
 from diffusers.modular_pipelines.ultimate_sd_upscale.input import UltimateSDUpscaleTilePlanStep
 from diffusers.modular_pipelines.ultimate_sd_upscale.modular_blocks_ultimate_sd_upscale import (
+    MultiDiffusionUpscaleBlocks,
     UltimateSDUpscaleBlocks,
 )
 from diffusers.modular_pipelines.ultimate_sd_upscale.utils_tiling import (
+    LatentTileSpec,
     SeamFixSpec,
     TileSpec,
     crop_tile,
@@ -50,11 +52,13 @@ from diffusers.modular_pipelines.ultimate_sd_upscale.utils_tiling import (
     paste_core_into_canvas,
     paste_core_into_canvas_blended,
     paste_seam_fix_band,
+    plan_latent_tiles,
     plan_seam_fix_bands,
     plan_tiles_chess,
     plan_tiles_linear,
     validate_tile_params,
 )
+from diffusers.modular_pipelines.ultimate_sd_upscale.denoise import _make_cosine_tile_weight
 
 
 class TestTileValidation(unittest.TestCase):
@@ -662,6 +666,103 @@ class TestControlNetSupport(unittest.TestCase):
         step(None, block_state, tile_idx=0, tile=dummy_tile)
         self.assertEqual(standard.calls, 0)
         self.assertEqual(controlnet.calls, 1)
+
+
+class TestLatentTilePlanning(unittest.TestCase):
+    """Latent-space tile planning for MultiDiffusion."""
+
+    def test_single_tile_when_small(self):
+        """Latent smaller than tile_size → one tile."""
+        tiles = plan_latent_tiles(32, 32, tile_size=64, overlap=8)
+        self.assertEqual(len(tiles), 1)
+        self.assertEqual(tiles[0].y, 0)
+        self.assertEqual(tiles[0].x, 0)
+        self.assertEqual(tiles[0].h, 32)
+        self.assertEqual(tiles[0].w, 32)
+
+    def test_tiles_cover_full_latent(self):
+        """All tiles together must cover every latent pixel at least once."""
+        latent_h, latent_w = 128, 128
+        tiles = plan_latent_tiles(latent_h, latent_w, tile_size=64, overlap=8)
+        canvas = np.zeros((latent_h, latent_w), dtype=np.int32)
+        for t in tiles:
+            canvas[t.y:t.y + t.h, t.x:t.x + t.w] += 1
+        self.assertTrue(np.all(canvas >= 1), "Some latent pixels are uncovered")
+
+    def test_overlap_region_covered_multiple_times(self):
+        """Interior regions should be covered by more than one tile."""
+        latent_h, latent_w = 128, 128
+        tiles = plan_latent_tiles(latent_h, latent_w, tile_size=64, overlap=8)
+        canvas = np.zeros((latent_h, latent_w), dtype=np.int32)
+        for t in tiles:
+            canvas[t.y:t.y + t.h, t.x:t.x + t.w] += 1
+        # Interior should have coverage > 1
+        self.assertTrue(np.any(canvas > 1), "No overlapping regions found")
+
+    def test_tile_size_respected(self):
+        """Every tile should have dimensions <= tile_size."""
+        tiles = plan_latent_tiles(256, 256, tile_size=64, overlap=8)
+        for t in tiles:
+            self.assertLessEqual(t.h, 64)
+            self.assertLessEqual(t.w, 64)
+
+    def test_invalid_overlap_raises(self):
+        with self.assertRaises(ValueError):
+            plan_latent_tiles(128, 128, tile_size=64, overlap=64)
+        with self.assertRaises(ValueError):
+            plan_latent_tiles(128, 128, tile_size=64, overlap=-1)
+
+
+class TestCosineWeight(unittest.TestCase):
+    """Cosine tile weight for MultiDiffusion blending."""
+
+    def test_shape(self):
+        w = _make_cosine_tile_weight(64, 64, overlap=8, device="cpu", dtype=torch.float32)
+        self.assertEqual(w.shape, (1, 1, 64, 64))
+
+    def test_center_is_one(self):
+        w = _make_cosine_tile_weight(64, 64, overlap=8, device="cpu", dtype=torch.float32)
+        self.assertAlmostEqual(w[0, 0, 32, 32].item(), 1.0)
+
+    def test_edges_fade(self):
+        w = _make_cosine_tile_weight(64, 64, overlap=8, device="cpu", dtype=torch.float32)
+        # First pixel should be close to 0
+        self.assertLess(w[0, 0, 0, 32].item(), 0.1)
+        self.assertLess(w[0, 0, 32, 0].item(), 0.1)
+
+    def test_no_overlap_all_ones(self):
+        w = _make_cosine_tile_weight(64, 64, overlap=0, device="cpu", dtype=torch.float32)
+        self.assertTrue(torch.all(w == 1.0))
+
+
+class TestMultiDiffusionBlocks(unittest.TestCase):
+    """MultiDiffusion pipeline import and initialization."""
+
+    def test_import_blocks(self):
+        blocks = MultiDiffusionUpscaleBlocks()
+        self.assertIsNotNone(blocks)
+
+    def test_block_names(self):
+        blocks = MultiDiffusionUpscaleBlocks()
+        expected = ["text_encoder", "upscale", "input", "set_timesteps", "multidiffusion"]
+        self.assertEqual(list(blocks.sub_blocks.keys()), expected)
+
+    def test_components_include_sdxl_core(self):
+        blocks = MultiDiffusionUpscaleBlocks()
+        names = blocks.component_names
+        for required in ["vae", "unet", "scheduler", "text_encoder", "text_encoder_2"]:
+            self.assertIn(required, names, f"Missing: {required}")
+
+    def test_inputs_include_multidiffusion_params(self):
+        blocks = MultiDiffusionUpscaleBlocks()
+        input_names = blocks.input_names
+        for param in ["latent_tile_size", "latent_overlap", "control_image"]:
+            self.assertIn(param, input_names, f"Missing input: {param}")
+
+    def test_workflow_map(self):
+        blocks = MultiDiffusionUpscaleBlocks()
+        self.assertIn("upscale", blocks._workflow_map)
+        self.assertIn("upscale_controlnet", blocks._workflow_map)
 
 
 if __name__ == "__main__":

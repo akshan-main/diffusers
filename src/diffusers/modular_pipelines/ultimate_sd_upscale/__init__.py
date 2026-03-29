@@ -21,7 +21,7 @@ except OptionalDependencyNotAvailable:
 
     _dummy_objects.update(get_objects_from_module(dummy_torch_and_transformers_objects))
 else:
-    _import_structure["modular_blocks_ultimate_sd_upscale"] = ["UltimateSDUpscaleBlocks"]
+    _import_structure["modular_blocks_ultimate_sd_upscale"] = ["UltimateSDUpscaleBlocks", "MultiDiffusionUpscaleBlocks"]
     _import_structure["modular_pipeline"] = ["UltimateSDUpscaleModularPipeline"]
 
 if TYPE_CHECKING or DIFFUSERS_SLOW_IMPORT:
@@ -31,7 +31,7 @@ if TYPE_CHECKING or DIFFUSERS_SLOW_IMPORT:
     except OptionalDependencyNotAvailable:
         from ...utils.dummy_torch_and_transformers_objects import *  # noqa F403
     else:
-        from .modular_blocks_ultimate_sd_upscale import UltimateSDUpscaleBlocks
+        from .modular_blocks_ultimate_sd_upscale import MultiDiffusionUpscaleBlocks, UltimateSDUpscaleBlocks
         from .modular_pipeline import UltimateSDUpscaleModularPipeline
 else:
     import sys
