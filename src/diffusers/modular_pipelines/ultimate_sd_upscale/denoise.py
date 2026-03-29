@@ -1132,7 +1132,7 @@ class UltimateSDUpscaleMultiDiffusionStep(ModularPipelineBlocks):
                 "controlnet_conditioning_scale": getattr(block_state, "controlnet_conditioning_scale", 1.0),
                 "guess_mode": getattr(block_state, "guess_mode", False),
                 "num_images_per_prompt": block_state.num_images_per_prompt,
-                "latents": torch.zeros(1),  # placeholder, needed for shape
+                "latents": torch.zeros(1, 4, h // 8, w // 8),  # shape placeholder for height/width
                 "batch_size": block_state.batch_size,
                 "timesteps": block_state.timesteps,
                 "crops_coords": None,
