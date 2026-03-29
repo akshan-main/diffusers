@@ -30,6 +30,7 @@ SDXL blocks are reused via their public interface by creating temporary
 import numpy as np
 import PIL.Image
 import torch
+from tqdm.auto import tqdm
 
 from ...configuration_utils import FrozenDict
 from ...guiders import ClassifierFreeGuidance
@@ -778,7 +779,7 @@ class UltimateSDUpscaleTileLoopStep(LoopSequentialPipelineBlocks):
 
         # Prepare one global latent noise tensor and crop from it per tile.
         # This keeps stochasticity consistent across tile boundaries.
-        vae_scale_factor = int(getattr(components.image_processor, "vae_scale_factor", 8))
+        vae_scale_factor = int(getattr(components, "vae_scale_factor", 8))
         latent_h = max(1, h // vae_scale_factor)
         latent_w = max(1, w // vae_scale_factor)
         effective_batch = block_state.batch_size * block_state.num_images_per_prompt
@@ -1117,31 +1118,23 @@ class UltimateSDUpscaleMultiDiffusionStep(ModularPipelineBlocks):
 
         # --- ControlNet setup ---
         control_image = getattr(block_state, "control_image", None)
-        use_controlnet = control_image is not None and hasattr(components, "controlnet") and components.controlnet is not None
+        use_controlnet = False
         full_controlnet_cond = None
-
-        if use_controlnet:
+        ctrl_pil = None
+        if control_image is not None:
+            if isinstance(control_image, list):
+                raise ValueError(
+                    "MultiDiffusion currently supports a single `control_image`, not a list."
+                )
+            if not hasattr(components, "controlnet") or components.controlnet is None:
+                raise ValueError(
+                    "`control_image` was provided but `controlnet` component is missing. "
+                    "Load a ControlNet model into `pipe.controlnet` first."
+                )
             ctrl_pil = _to_pil_rgb_image(control_image)
             if ctrl_pil.size != (w, h):
                 ctrl_pil = ctrl_pil.resize((w, h), PIL.Image.LANCZOS)
-            # Prepare full controlnet cond tensor
-            ctrl_state = _make_state({
-                "control_image": ctrl_pil,
-                "control_guidance_start": getattr(block_state, "control_guidance_start", 0.0),
-                "control_guidance_end": getattr(block_state, "control_guidance_end", 1.0),
-                "controlnet_conditioning_scale": getattr(block_state, "controlnet_conditioning_scale", 1.0),
-                "guess_mode": getattr(block_state, "guess_mode", False),
-                "num_images_per_prompt": block_state.num_images_per_prompt,
-                "latents": torch.zeros(1, 4, h // 8, w // 8),  # shape placeholder for height/width
-                "batch_size": block_state.batch_size,
-                "timesteps": block_state.timesteps,
-                "crops_coords": None,
-            })
-            components, ctrl_state = self._prepare_controlnet(components, ctrl_state)
-            full_controlnet_cond = ctrl_state.get("controlnet_cond")
-            block_state._cn_cond_scale = ctrl_state.get("conditioning_scale")
-            block_state._cn_controlnet_keep = ctrl_state.get("controlnet_keep")
-            logger.info("MultiDiffusion: ControlNet enabled.")
+            use_controlnet = True
 
         # --- VAE encode full upscaled image ---
         enc_state = _make_state({
@@ -1169,6 +1162,27 @@ class UltimateSDUpscaleMultiDiffusionStep(ModularPipelineBlocks):
         })
         components, lat_state = self._prepare_latents(components, lat_state)
         latents = lat_state.get("latents")
+
+        # Prepare full-resolution ControlNet conditioning with the real latent shape.
+        if use_controlnet:
+            ctrl_state = _make_state({
+                "control_image": ctrl_pil,
+                "control_guidance_start": getattr(block_state, "control_guidance_start", 0.0),
+                "control_guidance_end": getattr(block_state, "control_guidance_end", 1.0),
+                "controlnet_conditioning_scale": getattr(block_state, "controlnet_conditioning_scale", 1.0),
+                "guess_mode": getattr(block_state, "guess_mode", False),
+                "num_images_per_prompt": block_state.num_images_per_prompt,
+                "latents": latents,
+                "batch_size": block_state.batch_size,
+                "timesteps": block_state.timesteps,
+                "crops_coords": None,
+            })
+            components, ctrl_state = self._prepare_controlnet(components, ctrl_state)
+            full_controlnet_cond = ctrl_state.get("controlnet_cond")
+            block_state._cn_cond_scale = ctrl_state.get("conditioning_scale")
+            block_state._cn_controlnet_keep = ctrl_state.get("controlnet_keep")
+            block_state.guess_mode = ctrl_state.get("guess_mode")
+            logger.info("MultiDiffusion: ControlNet enabled.")
 
         # --- Prepare additional conditioning ---
         cond_state = _make_state({
@@ -1204,65 +1218,62 @@ class UltimateSDUpscaleMultiDiffusionStep(ModularPipelineBlocks):
 
         # --- MultiDiffusion denoise loop ---
         timesteps = block_state.timesteps
-        vae_scale_factor = int(getattr(components.image_processor, "vae_scale_factor", 8))
+        vae_scale_factor = int(getattr(components, "vae_scale_factor", 8))
+        progress_kwargs = getattr(components, "_progress_bar_config", {})
+        if not isinstance(progress_kwargs, dict):
+            progress_kwargs = {}
 
-        num_warmup_steps = max(len(timesteps) - block_state.num_inference_steps * components.scheduler.order, 0)
+        for i, t in enumerate(
+            tqdm(timesteps, total=block_state.num_inference_steps, desc="MultiDiffusion", **progress_kwargs)
+        ):
+            # Accumulators for noise prediction blending
+            noise_pred_accum = torch.zeros_like(latents)
+            weight_accum = torch.zeros(
+                1, 1, latent_h, latent_w,
+                device=latents.device, dtype=latents.dtype,
+            )
 
-        with self.progress_bar(total=block_state.num_inference_steps) as progress_bar:
-            for i, t in enumerate(timesteps):
-                # Accumulators for noise prediction blending
-                noise_pred_accum = torch.zeros_like(latents)
-                weight_accum = torch.zeros(
-                    1, 1, latent_h, latent_w,
-                    device=latents.device, dtype=latents.dtype,
+            for tile in tile_specs:
+                # Crop tile from full latents
+                tile_latents = latents[:, :, tile.y:tile.y + tile.h, tile.x:tile.x + tile.w].clone()
+
+                # Crop ControlNet cond for this tile (pixel space)
+                cn_tile = None
+                if use_controlnet and full_controlnet_cond is not None:
+                    py = tile.y * vae_scale_factor
+                    px = tile.x * vae_scale_factor
+                    ph = tile.h * vae_scale_factor
+                    pw = tile.w * vae_scale_factor
+                    cn_tile = full_controlnet_cond[:, :, py:py + ph, px:px + pw]
+
+                # Run UNet (+ ControlNet + guider) on this tile
+                tile_noise_pred = self._run_tile_unet(
+                    components, tile_latents, t, i, block_state, cn_tile,
                 )
 
-                for tile in tile_specs:
-                    # Crop tile from full latents
-                    tile_latents = latents[:, :, tile.y:tile.y + tile.h, tile.x:tile.x + tile.w].clone()
+                # Cosine weight for this tile
+                tile_weight = _make_cosine_tile_weight(
+                    tile.h, tile.w, latent_overlap,
+                    latents.device, latents.dtype,
+                )
 
-                    # Crop ControlNet cond for this tile (pixel space)
-                    cn_tile = None
-                    if use_controlnet and full_controlnet_cond is not None:
-                        py = tile.y * vae_scale_factor
-                        px = tile.x * vae_scale_factor
-                        ph = tile.h * vae_scale_factor
-                        pw = tile.w * vae_scale_factor
-                        cn_tile = full_controlnet_cond[:, :, py:py + ph, px:px + pw]
+                # Accumulate
+                noise_pred_accum[:, :, tile.y:tile.y + tile.h, tile.x:tile.x + tile.w] += (
+                    tile_noise_pred * tile_weight
+                )
+                weight_accum[:, :, tile.y:tile.y + tile.h, tile.x:tile.x + tile.w] += tile_weight
 
-                    # Run UNet (+ ControlNet + guider) on this tile
-                    tile_noise_pred = self._run_tile_unet(
-                        components, tile_latents, t, i, block_state, cn_tile,
-                    )
+            # Normalize (MultiDiffusion weighted average)
+            blended_noise_pred = noise_pred_accum / weight_accum.clamp(min=1e-8)
 
-                    # Cosine weight for this tile
-                    tile_weight = _make_cosine_tile_weight(
-                        tile.h, tile.w, latent_overlap,
-                        latents.device, latents.dtype,
-                    )
-
-                    # Accumulate
-                    noise_pred_accum[:, :, tile.y:tile.y + tile.h, tile.x:tile.x + tile.w] += (
-                        tile_noise_pred * tile_weight
-                    )
-                    weight_accum[:, :, tile.y:tile.y + tile.h, tile.x:tile.x + tile.w] += tile_weight
-
-                # Normalize (MultiDiffusion weighted average)
-                blended_noise_pred = noise_pred_accum / weight_accum.clamp(min=1e-8)
-
-                # Scheduler step on full latent
-                latents_dtype = latents.dtype
-                latents = components.scheduler.step(
-                    blended_noise_pred, t, latents,
-                    return_dict=False,
-                )[0]
-                if latents.dtype != latents_dtype and torch.backends.mps.is_available():
-                    latents = latents.to(latents_dtype)
-
-                if i == len(timesteps) - 1 or (
-                    (i + 1) > num_warmup_steps and (i + 1) % components.scheduler.order == 0
-                ):
-                    progress_bar.update()
+            # Scheduler step on full latent
+            latents_dtype = latents.dtype
+            latents = components.scheduler.step(
+                blended_noise_pred, t, latents,
+                return_dict=False,
+            )[0]
+            if latents.dtype != latents_dtype and torch.backends.mps.is_available():
+                latents = latents.to(latents_dtype)
 
         # --- Decode ---
         decode_state = _make_state({
