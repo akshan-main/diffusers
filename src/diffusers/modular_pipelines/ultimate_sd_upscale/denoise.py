@@ -852,11 +852,16 @@ class UltimateSDUpscaleTileLoopStep(LoopSequentialPipelineBlocks):
 # =============================================================================
 
 
-def _make_cosine_tile_weight(h: int, w: int, overlap: int, device, dtype) -> torch.Tensor:
-    """Create a 2D cosine-ramp weight tensor for MultiDiffusion blending.
+def _make_cosine_tile_weight(
+    h: int, w: int, overlap: int, device, dtype,
+    is_top: bool = False, is_bottom: bool = False,
+    is_left: bool = False, is_right: bool = False,
+) -> torch.Tensor:
+    """Create a boundary-aware 2D cosine-ramp weight for MultiDiffusion blending.
 
-    Weight is 1.0 in the center and smoothly fades to ~0 at tile edges via a
-    raised-cosine (Hann) window in the overlap regions.
+    Weight is 1.0 in the center and smoothly fades at edges that overlap with
+    neighboring tiles. Edges that touch the image boundary keep weight=1.0 to
+    prevent noise amplification from dividing by near-zero weights.
 
     Args:
         h: Tile height in latent pixels.
@@ -864,22 +869,28 @@ def _make_cosine_tile_weight(h: int, w: int, overlap: int, device, dtype) -> tor
         overlap: Overlap in latent pixels.
         device: Torch device.
         dtype: Torch dtype.
+        is_top: True if this tile touches the top image boundary.
+        is_bottom: True if this tile touches the bottom image boundary.
+        is_left: True if this tile touches the left image boundary.
+        is_right: True if this tile touches the right image boundary.
 
     Returns:
         Tensor of shape ``(1, 1, h, w)`` for broadcasting.
     """
     import math
 
-    def _ramp(length, overlap_size):
+    def _ramp(length, overlap_size, keep_start, keep_end):
         ramp = torch.ones(length, device=device, dtype=dtype)
         if overlap_size > 0 and length > 2 * overlap_size:
             fade = 0.5 * (1.0 - torch.cos(torch.linspace(0, math.pi, overlap_size, device=device, dtype=dtype)))
-            ramp[:overlap_size] = fade
-            ramp[-overlap_size:] = fade.flip(0)
+            if not keep_start:
+                ramp[:overlap_size] = fade
+            if not keep_end:
+                ramp[-overlap_size:] = fade.flip(0)
         return ramp
 
-    w_h = _ramp(h, overlap)
-    w_w = _ramp(w, overlap)
+    w_h = _ramp(h, overlap, keep_start=is_top, keep_end=is_bottom)
+    w_w = _ramp(w, overlap, keep_start=is_left, keep_end=is_right)
     return (w_h[:, None] * w_w[None, :]).unsqueeze(0).unsqueeze(0)
 
 
@@ -1253,10 +1264,14 @@ class UltimateSDUpscaleMultiDiffusionStep(ModularPipelineBlocks):
                     components, tile_latents, t, i, block_state, cn_tile,
                 )
 
-                # Cosine weight for this tile
+                # Boundary-aware cosine weight for this tile
                 tile_weight = _make_cosine_tile_weight(
                     tile.h, tile.w, latent_overlap,
                     latents.device, torch.float32,
+                    is_top=(tile.y == 0),
+                    is_bottom=(tile.y + tile.h >= latent_h),
+                    is_left=(tile.x == 0),
+                    is_right=(tile.x + tile.w >= latent_w),
                 )
 
                 # Accumulate
