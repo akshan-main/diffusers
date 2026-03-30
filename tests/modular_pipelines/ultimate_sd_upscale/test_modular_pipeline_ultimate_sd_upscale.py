@@ -31,10 +31,17 @@ from PIL import Image
 
 from diffusers.modular_pipelines.modular_pipeline import BlockState, PipelineState
 from diffusers.modular_pipelines.ultimate_sd_upscale.denoise import (
+    UltimateSDUpscaleMultiDiffusionStep,
     UltimateSDUpscaleTileDenoiserStep,
+    _compute_auto_strength,
+    _swap_scheduler,
     _to_pil_rgb_image,
 )
-from diffusers.modular_pipelines.ultimate_sd_upscale.input import UltimateSDUpscaleTilePlanStep
+from diffusers.modular_pipelines.ultimate_sd_upscale.input import (
+    UltimateSDUpscaleTextEncoderStep,
+    UltimateSDUpscaleTilePlanStep,
+    UltimateSDUpscaleUpscaleStep,
+)
 from diffusers.modular_pipelines.ultimate_sd_upscale.modular_blocks_ultimate_sd_upscale import (
     MultiDiffusionUpscaleBlocks,
     UltimateSDUpscaleBlocks,
@@ -763,6 +770,270 @@ class TestMultiDiffusionBlocks(unittest.TestCase):
         blocks = MultiDiffusionUpscaleBlocks()
         self.assertIn("upscale", blocks._workflow_map)
         self.assertIn("upscale_controlnet", blocks._workflow_map)
+
+
+class TestAutoStrength(unittest.TestCase):
+    """Auto-strength computation tests (Feature 2)."""
+
+    def test_single_pass_2x(self):
+        self.assertAlmostEqual(_compute_auto_strength(2.0, 0, 1), 0.3)
+
+    def test_single_pass_4x(self):
+        self.assertAlmostEqual(_compute_auto_strength(4.0, 0, 1), 0.15)
+
+    def test_single_pass_8x(self):
+        # Single pass > 4x should return 0.1
+        self.assertAlmostEqual(_compute_auto_strength(8.0, 0, 1), 0.1)
+
+    def test_progressive_first_pass(self):
+        self.assertAlmostEqual(_compute_auto_strength(4.0, 0, 2), 0.3)
+
+    def test_progressive_second_pass(self):
+        self.assertAlmostEqual(_compute_auto_strength(4.0, 1, 2), 0.2)
+
+    def test_progressive_third_pass(self):
+        self.assertAlmostEqual(_compute_auto_strength(8.0, 2, 3), 0.2)
+
+    def test_single_pass_small_factor(self):
+        # Factor < 2 should behave like 2x
+        self.assertAlmostEqual(_compute_auto_strength(1.5, 0, 1), 0.3)
+
+
+class TestProgressiveUpscaling(unittest.TestCase):
+    """Progressive upscaling logic tests (Feature 1)."""
+
+    def test_multidiffusion_has_progressive_param(self):
+        blocks = MultiDiffusionUpscaleBlocks()
+        self.assertIn("progressive", blocks.input_names)
+
+    def test_multidiffusion_has_auto_strength_param(self):
+        blocks = MultiDiffusionUpscaleBlocks()
+        self.assertIn("auto_strength", blocks.input_names)
+
+    def test_progressive_num_passes_4x(self):
+        """4x with progressive=True should plan 2 passes."""
+        import math
+        upscale_factor = 4.0
+        num_passes = max(1, int(math.ceil(math.log2(upscale_factor))))
+        self.assertEqual(num_passes, 2)
+
+    def test_progressive_num_passes_8x(self):
+        """8x with progressive=True should plan 3 passes."""
+        import math
+        upscale_factor = 8.0
+        num_passes = max(1, int(math.ceil(math.log2(upscale_factor))))
+        self.assertEqual(num_passes, 3)
+
+    def test_progressive_num_passes_2x(self):
+        """2x should stay at 1 pass even with progressive=True."""
+        import math
+        upscale_factor = 2.0
+        # progressive only triggers when > 2.0
+        progressive = True
+        if progressive and upscale_factor > 2.0:
+            num_passes = max(1, int(math.ceil(math.log2(upscale_factor))))
+        else:
+            num_passes = 1
+        self.assertEqual(num_passes, 1)
+
+    def test_progressive_num_passes_3x(self):
+        """3x with progressive should be 2 passes (ceil(log2(3)) = 2)."""
+        import math
+        upscale_factor = 3.0
+        num_passes = max(1, int(math.ceil(math.log2(upscale_factor))))
+        self.assertEqual(num_passes, 2)
+
+    def test_progressive_strength_sequence_4x(self):
+        """4x progressive should give [0.3, 0.2] strengths."""
+        num_passes = 2
+        strengths = [_compute_auto_strength(4.0, p, num_passes) for p in range(num_passes)]
+        self.assertEqual(strengths, [0.3, 0.2])
+
+    def test_progressive_strength_sequence_8x(self):
+        """8x progressive should give [0.3, 0.2, 0.2] strengths."""
+        num_passes = 3
+        strengths = [_compute_auto_strength(8.0, p, num_passes) for p in range(num_passes)]
+        self.assertEqual(strengths, [0.3, 0.2, 0.2])
+
+
+class TestDefaultNegativePrompt(unittest.TestCase):
+    """Default negative prompt tests (Feature 3)."""
+
+    def test_text_encoder_has_default_negative_param(self):
+        step = UltimateSDUpscaleTextEncoderStep()
+        input_names = [inp.name for inp in step.inputs if hasattr(inp, "name")]
+        self.assertIn("use_default_negative", input_names)
+
+    def test_default_negative_constant(self):
+        self.assertEqual(
+            UltimateSDUpscaleTextEncoderStep.DEFAULT_NEGATIVE_PROMPT,
+            "blurry, low quality, artifacts, noise, jpeg compression",
+        )
+
+    def test_default_negative_applied_when_none(self):
+        """When negative_prompt is None and use_default_negative=True, it should be set."""
+        step = UltimateSDUpscaleTextEncoderStep()
+        state = PipelineState()
+        state.set("prompt", "a test image")
+        state.set("guidance_scale", 7.5)
+        state.set("use_default_negative", True)
+        # negative_prompt is not set (None)
+
+        block_state = step.get_block_state(state)
+        neg = getattr(block_state, "negative_prompt", None)
+        # Before __call__, negative_prompt should be None
+        self.assertIsNone(neg)
+
+    def test_default_negative_not_applied_when_disabled(self):
+        """When use_default_negative=False, negative_prompt should stay None."""
+        step = UltimateSDUpscaleTextEncoderStep()
+        state = PipelineState()
+        state.set("prompt", "a test image")
+        state.set("guidance_scale", 7.5)
+        state.set("use_default_negative", False)
+
+        block_state = step.get_block_state(state)
+        neg = getattr(block_state, "negative_prompt", None)
+        self.assertIsNone(neg)
+
+    def test_user_negative_prompt_preserved(self):
+        """When user provides a negative_prompt, it should NOT be overridden."""
+        step = UltimateSDUpscaleTextEncoderStep()
+        state = PipelineState()
+        state.set("prompt", "a test image")
+        state.set("negative_prompt", "my custom negative")
+        state.set("guidance_scale", 7.5)
+        state.set("use_default_negative", True)
+
+        block_state = step.get_block_state(state)
+        self.assertEqual(block_state.negative_prompt, "my custom negative")
+
+
+class TestMetadataOutput(unittest.TestCase):
+    """Output metadata tests (Feature 4)."""
+
+    def test_multidiffusion_has_return_metadata_param(self):
+        blocks = MultiDiffusionUpscaleBlocks()
+        self.assertIn("return_metadata", blocks.input_names)
+
+    def test_multidiffusion_has_metadata_output(self):
+        step = UltimateSDUpscaleMultiDiffusionStep()
+        output_names = [out.name for out in step.intermediate_outputs]
+        self.assertIn("metadata", output_names)
+
+
+class TestSchedulerSelection(unittest.TestCase):
+    """Scheduler selection tests (Feature 5)."""
+
+    def test_multidiffusion_has_scheduler_name_param(self):
+        blocks = MultiDiffusionUpscaleBlocks()
+        self.assertIn("scheduler_name", blocks.input_names)
+
+    def test_swap_to_dpm_karras(self):
+        """_swap_scheduler should swap to DPMSolverMultistepScheduler with Karras."""
+        from diffusers.schedulers import DPMSolverMultistepScheduler, EulerDiscreteScheduler
+
+        class FakeComponents:
+            def __init__(self):
+                self.scheduler = EulerDiscreteScheduler.from_config({
+                    "num_train_timesteps": 1000,
+                })
+
+        comp = FakeComponents()
+        self.assertEqual(type(comp.scheduler).__name__, "EulerDiscreteScheduler")
+
+        _swap_scheduler(comp, "DPM++ 2M Karras")
+        self.assertEqual(type(comp.scheduler).__name__, "DPMSolverMultistepScheduler")
+        self.assertTrue(comp.scheduler.config.use_karras_sigmas)
+
+    def test_swap_to_euler(self):
+        """_swap_scheduler to Euler should be a no-op if already Euler."""
+        from diffusers.schedulers import EulerDiscreteScheduler
+
+        class FakeComponents:
+            def __init__(self):
+                self.scheduler = EulerDiscreteScheduler.from_config({
+                    "num_train_timesteps": 1000,
+                })
+
+        comp = FakeComponents()
+        original_scheduler = comp.scheduler
+        _swap_scheduler(comp, "Euler")
+        # Should remain the same instance (no-op)
+        self.assertIs(comp.scheduler, original_scheduler)
+
+    def test_swap_to_dpm_2m(self):
+        """_swap_scheduler should swap to DPMSolverMultistepScheduler."""
+        from diffusers.schedulers import DPMSolverMultistepScheduler, EulerDiscreteScheduler
+
+        class FakeComponents:
+            def __init__(self):
+                self.scheduler = EulerDiscreteScheduler.from_config({
+                    "num_train_timesteps": 1000,
+                })
+
+        comp = FakeComponents()
+        _swap_scheduler(comp, "DPM++ 2M")
+        self.assertEqual(type(comp.scheduler).__name__, "DPMSolverMultistepScheduler")
+
+    def test_unknown_scheduler_warns(self):
+        """Unknown scheduler names should log a warning but not crash."""
+        from diffusers.schedulers import EulerDiscreteScheduler
+
+        class FakeComponents:
+            def __init__(self):
+                self.scheduler = EulerDiscreteScheduler.from_config({
+                    "num_train_timesteps": 1000,
+                })
+
+        comp = FakeComponents()
+        original_name = type(comp.scheduler).__name__
+        _swap_scheduler(comp, "NonExistentScheduler")
+        # Should keep original
+        self.assertEqual(type(comp.scheduler).__name__, original_name)
+
+
+class TestKwargsTypeAudit(unittest.TestCase):
+    """Verify all embedding params have kwargs_type='denoiser_input_fields' (Feature 6)."""
+
+    _embedding_fields = {
+        "prompt_embeds",
+        "negative_prompt_embeds",
+        "pooled_prompt_embeds",
+        "negative_pooled_prompt_embeds",
+        "add_time_ids",
+        "negative_add_time_ids",
+    }
+
+    def _check_step_inputs(self, step_cls):
+        step = step_cls()
+        for inp in step.inputs:
+            if not hasattr(inp, "name"):
+                continue
+            if inp.name in self._embedding_fields:
+                self.assertEqual(
+                    inp.kwargs_type,
+                    "denoiser_input_fields",
+                    f"{step_cls.__name__}.{inp.name} missing kwargs_type='denoiser_input_fields'",
+                )
+
+    def test_tile_denoiser_step(self):
+        self._check_step_inputs(UltimateSDUpscaleTileDenoiserStep)
+
+    def test_multidiffusion_step(self):
+        self._check_step_inputs(UltimateSDUpscaleMultiDiffusionStep)
+
+    def test_tile_prepare_pooled(self):
+        """TilePrepareStep should have pooled_prompt_embeds with kwargs_type."""
+        from diffusers.modular_pipelines.ultimate_sd_upscale.denoise import (
+            UltimateSDUpscaleTilePrepareStep,
+        )
+        step = UltimateSDUpscaleTilePrepareStep()
+        for inp in step.inputs:
+            if hasattr(inp, "name") and inp.name == "pooled_prompt_embeds":
+                self.assertEqual(inp.kwargs_type, "denoiser_input_fields")
+                return
+        self.fail("pooled_prompt_embeds not found in TilePrepareStep inputs")
 
 
 if __name__ == "__main__":

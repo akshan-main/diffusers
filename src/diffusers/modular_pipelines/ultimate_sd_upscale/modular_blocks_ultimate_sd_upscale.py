@@ -42,9 +42,8 @@ from ..stable_diffusion_xl.before_denoise import (
     StableDiffusionXLImg2ImgSetTimestepsStep,
     StableDiffusionXLInputStep,
 )
-from ..stable_diffusion_xl.encoders import StableDiffusionXLTextEncoderStep
 from .denoise import UltimateSDUpscaleMultiDiffusionStep, UltimateSDUpscaleTileLoopStep
-from .input import UltimateSDUpscaleTilePlanStep, UltimateSDUpscaleUpscaleStep
+from .input import UltimateSDUpscaleTextEncoderStep, UltimateSDUpscaleTilePlanStep, UltimateSDUpscaleUpscaleStep
 
 
 logger = logging.get_logger(__name__)
@@ -70,7 +69,7 @@ class UltimateSDUpscaleBlocks(SequentialPipelineBlocks):
     """
 
     block_classes = [
-        StableDiffusionXLTextEncoderStep,
+        UltimateSDUpscaleTextEncoderStep,
         UltimateSDUpscaleUpscaleStep,
         UltimateSDUpscaleTilePlanStep,
         StableDiffusionXLInputStep,
@@ -132,7 +131,7 @@ class MultiDiffusionUpscaleBlocks(SequentialPipelineBlocks):
     """
 
     block_classes = [
-        StableDiffusionXLTextEncoderStep,
+        UltimateSDUpscaleTextEncoderStep,
         UltimateSDUpscaleUpscaleStep,
         StableDiffusionXLInputStep,
         StableDiffusionXLImg2ImgSetTimestepsStep,

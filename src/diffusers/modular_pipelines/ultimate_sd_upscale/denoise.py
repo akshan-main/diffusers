@@ -27,6 +27,9 @@ SDXL blocks are reused via their public interface by creating temporary
 ``PipelineState`` objects, NOT by calling private helpers.
 """
 
+import math
+import time
+
 import numpy as np
 import PIL.Image
 import torch
@@ -36,7 +39,7 @@ from ...configuration_utils import FrozenDict
 from ...guiders import ClassifierFreeGuidance
 from ...image_processor import VaeImageProcessor
 from ...models import AutoencoderKL, ControlNetModel, UNet2DConditionModel
-from ...schedulers import EulerDiscreteScheduler
+from ...schedulers import DPMSolverMultistepScheduler, EulerDiscreteScheduler
 from ...utils import logging
 from ...utils.torch_utils import randn_tensor
 from ..modular_pipeline import (
@@ -135,6 +138,84 @@ def _to_pil_rgb_image(image) -> PIL.Image.Image:
     raise ValueError(
         f"Unsupported `control_image` type {type(image)}. Expected PIL.Image, torch.Tensor, or numpy.ndarray."
     )
+
+
+# ---------------------------------------------------------------------------
+# Scheduler swap helper (Feature 5)
+# ---------------------------------------------------------------------------
+
+_SCHEDULER_ALIASES = {
+    "euler": "EulerDiscreteScheduler",
+    "euler discrete": "EulerDiscreteScheduler",
+    "eulerdiscretescheduler": "EulerDiscreteScheduler",
+    "dpm++ 2m": "DPMSolverMultistepScheduler",
+    "dpmsolvermultistepscheduler": "DPMSolverMultistepScheduler",
+    "dpm++ 2m karras": "DPMSolverMultistepScheduler+karras",
+}
+
+
+def _swap_scheduler(components, scheduler_name: str):
+    """Swap the scheduler on ``components`` given a human-readable name.
+
+    Supported names (case-insensitive):
+        - ``"Euler"`` / ``"EulerDiscreteScheduler"``
+        - ``"DPM++ 2M"`` / ``"DPMSolverMultistepScheduler"``
+        - ``"DPM++ 2M Karras"`` (DPMSolverMultistep with Karras sigmas)
+
+    If the requested scheduler is already active, this is a no-op.
+    """
+    key = scheduler_name.strip().lower()
+    resolved = _SCHEDULER_ALIASES.get(key, key)
+
+    use_karras = resolved.endswith("+karras")
+    if use_karras:
+        resolved = resolved.replace("+karras", "")
+
+    current = type(components.scheduler).__name__
+
+    if resolved == "EulerDiscreteScheduler":
+        if current != "EulerDiscreteScheduler":
+            components.scheduler = EulerDiscreteScheduler.from_config(components.scheduler.config)
+            logger.info("Swapped scheduler to EulerDiscreteScheduler")
+    elif resolved == "DPMSolverMultistepScheduler":
+        if current != "DPMSolverMultistepScheduler" or (
+            use_karras and not getattr(components.scheduler.config, "use_karras_sigmas", False)
+        ):
+            extra_kwargs = {}
+            if use_karras:
+                extra_kwargs["use_karras_sigmas"] = True
+            components.scheduler = DPMSolverMultistepScheduler.from_config(
+                components.scheduler.config, **extra_kwargs
+            )
+            logger.info(f"Swapped scheduler to DPMSolverMultistepScheduler (karras={use_karras})")
+    else:
+        logger.warning(
+            f"Unknown scheduler_name '{scheduler_name}'. Keeping current scheduler "
+            f"({current}). Supported: 'Euler', 'DPM++ 2M', 'DPM++ 2M Karras'."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Auto-strength helper (Feature 2)
+# ---------------------------------------------------------------------------
+
+def _compute_auto_strength(upscale_factor: float, pass_index: int, num_passes: int) -> float:
+    """Return the auto-scaled denoise strength for a given pass.
+
+    Rules:
+        - Single-pass 2x: 0.3
+        - Single-pass 4x: 0.15
+        - Progressive passes: first pass=0.3, subsequent passes=0.2
+    """
+    if num_passes > 1:
+        return 0.3 if pass_index == 0 else 0.2
+    # Single pass
+    if upscale_factor <= 2.0:
+        return 0.3
+    elif upscale_factor <= 4.0:
+        return 0.15
+    else:
+        return 0.1
 
 
 # ---------------------------------------------------------------------------
@@ -884,8 +965,6 @@ def _make_cosine_tile_weight(
     Returns:
         Tensor of shape ``(1, 1, h, w)`` for broadcasting.
     """
-    import math
-
     def _ramp(length, overlap_size, keep_start, keep_end):
         ramp = torch.ones(length, device=device, dtype=dtype)
         if overlap_size > 0 and length > 2 * overlap_size:
@@ -980,6 +1059,10 @@ class UltimateSDUpscaleMultiDiffusionStep(ModularPipelineBlocks):
             InputParam("upscaled_image", type_hint=PIL.Image.Image, required=True),
             InputParam("upscaled_height", type_hint=int, required=True),
             InputParam("upscaled_width", type_hint=int, required=True),
+            InputParam("image", type_hint=PIL.Image.Image,
+                       description="Original input image (before upscaling). Needed for progressive mode."),
+            InputParam("upscale_factor", type_hint=float, default=2.0,
+                       description="Total upscale factor. Used for auto-strength and progressive upscaling."),
             InputParam("generator"),
             InputParam("batch_size", type_hint=int, required=True),
             InputParam("num_images_per_prompt", type_hint=int, default=1),
@@ -1015,12 +1098,30 @@ class UltimateSDUpscaleMultiDiffusionStep(ModularPipelineBlocks):
             InputParam("control_guidance_end", default=1.0),
             InputParam("controlnet_conditioning_scale", default=1.0),
             InputParam("guess_mode", default=False),
+            # Progressive upscaling (Feature 1)
+            InputParam("progressive", type_hint=bool, default=True,
+                       description="When True and upscale_factor > 2, split into multiple 2x passes "
+                       "instead of one big jump. E.g. 4x = 2x then 2x."),
+            # Auto-strength (Feature 2)
+            InputParam("auto_strength", type_hint=bool, default=True,
+                       description="When True and user does not explicitly pass strength, automatically "
+                       "scale denoise strength based on upscale factor and pass index."),
+            # Output metadata (Feature 4)
+            InputParam("return_metadata", type_hint=bool, default=False,
+                       description="When True, include generation metadata (sizes, passes, timings) "
+                       "in the output."),
+            # Scheduler selection (Feature 5)
+            InputParam("scheduler_name", type_hint=str, default=None,
+                       description="Optional scheduler name to swap before running. "
+                       "Supported: 'Euler', 'DPM++ 2M', 'DPM++ 2M Karras'."),
         ]
 
     @property
     def intermediate_outputs(self) -> list[OutputParam]:
         return [
             OutputParam("images", type_hint=list, description="Final upscaled output images."),
+            OutputParam("metadata", type_hint=dict,
+                        description="Generation metadata (when return_metadata=True)."),
         ]
 
     def _run_tile_unet(
@@ -1033,8 +1134,6 @@ class UltimateSDUpscaleMultiDiffusionStep(ModularPipelineBlocks):
         controlnet_cond_tile=None,
     ) -> torch.Tensor:
         """Run guider + UNet (+ optional ControlNet) on one tile, return noise_pred."""
-        import inspect
-
         # Scale input
         scaled_latents = components.scheduler.scale_model_input(tile_latents, t)
 
@@ -1134,43 +1233,34 @@ class UltimateSDUpscaleMultiDiffusionStep(ModularPipelineBlocks):
         noise_pred = components.guider(guider_state)[0]
         return noise_pred
 
-    @torch.no_grad()
-    def __call__(self, components, state: PipelineState) -> PipelineState:
-        block_state = self.get_block_state(state)
-
-        h = block_state.upscaled_height
-        w = block_state.upscaled_width
-        output_type = block_state.output_type
-        latent_tile_size = block_state.latent_tile_size
-        latent_overlap = block_state.latent_overlap
+    def _run_single_pass(
+        self,
+        components,
+        block_state,
+        upscaled_image: PIL.Image.Image,
+        h: int,
+        w: int,
+        ctrl_pil,
+        use_controlnet: bool,
+        latent_tile_size: int,
+        latent_overlap: int,
+    ) -> np.ndarray:
+        """Run one MultiDiffusion encode-denoise-decode pass, return decoded numpy (h, w, 3)."""
+        from ..stable_diffusion_xl.before_denoise import retrieve_timesteps
 
         # --- Enable VAE tiling ---
         if hasattr(components.vae, "enable_tiling"):
             components.vae.enable_tiling()
 
-        # --- ControlNet setup ---
-        control_image = getattr(block_state, "control_image", None)
-        use_controlnet = False
+        # --- ControlNet setup for this pass ---
         full_controlnet_cond = None
-        ctrl_pil = None
-        if control_image is not None:
-            if isinstance(control_image, list):
-                raise ValueError(
-                    "MultiDiffusion currently supports a single `control_image`, not a list."
-                )
-            if not hasattr(components, "controlnet") or components.controlnet is None:
-                raise ValueError(
-                    "`control_image` was provided but `controlnet` component is missing. "
-                    "Load a ControlNet model into `pipe.controlnet` first."
-                )
-            ctrl_pil = _to_pil_rgb_image(control_image)
+        if use_controlnet and ctrl_pil is not None:
             if ctrl_pil.size != (w, h):
                 ctrl_pil = ctrl_pil.resize((w, h), PIL.Image.LANCZOS)
-            use_controlnet = True
 
-        # --- VAE encode full upscaled image ---
+        # --- VAE encode ---
         enc_state = _make_state({
-            "image": block_state.upscaled_image,
+            "image": upscaled_image,
             "height": h,
             "width": w,
             "generator": block_state.generator,
@@ -1180,8 +1270,21 @@ class UltimateSDUpscaleMultiDiffusionStep(ModularPipelineBlocks):
         components, enc_state = self._vae_encoder(components, enc_state)
         image_latents = enc_state.get("image_latents")
 
+        # --- Re-compute timesteps for this pass's strength ---
+        # Reset scheduler timesteps so the current strength is applied correctly.
+        pass_strength = block_state._current_pass_strength
+        _ts, _nsteps = retrieve_timesteps(
+            components.scheduler,
+            block_state.num_inference_steps,
+            components._execution_device,
+        )
+        from ..stable_diffusion_xl.before_denoise import StableDiffusionXLImg2ImgSetTimestepsStep
+        timesteps, num_inf_steps = StableDiffusionXLImg2ImgSetTimestepsStep.get_timesteps(
+            components, block_state.num_inference_steps, pass_strength, components._execution_device,
+        )
+        latent_timestep = timesteps[:1].repeat(block_state.batch_size * block_state.num_images_per_prompt)
+
         # --- Prepare latents (add noise) ---
-        latent_timestep = block_state.latent_timestep
         lat_state = _make_state({
             "image_latents": image_latents,
             "latent_timestep": latent_timestep,
@@ -1195,8 +1298,8 @@ class UltimateSDUpscaleMultiDiffusionStep(ModularPipelineBlocks):
         components, lat_state = self._prepare_latents(components, lat_state)
         latents = lat_state.get("latents")
 
-        # Prepare full-resolution ControlNet conditioning with the real latent shape.
-        if use_controlnet:
+        # ControlNet conditioning
+        if use_controlnet and ctrl_pil is not None:
             ctrl_state = _make_state({
                 "control_image": ctrl_pil,
                 "control_guidance_start": getattr(block_state, "control_guidance_start", 0.0),
@@ -1206,7 +1309,7 @@ class UltimateSDUpscaleMultiDiffusionStep(ModularPipelineBlocks):
                 "num_images_per_prompt": block_state.num_images_per_prompt,
                 "latents": latents,
                 "batch_size": block_state.batch_size,
-                "timesteps": block_state.timesteps,
+                "timesteps": timesteps,
                 "crops_coords": None,
             })
             components, ctrl_state = self._prepare_controlnet(components, ctrl_state)
@@ -1214,9 +1317,8 @@ class UltimateSDUpscaleMultiDiffusionStep(ModularPipelineBlocks):
             block_state._cn_cond_scale = ctrl_state.get("conditioning_scale")
             block_state._cn_controlnet_keep = ctrl_state.get("controlnet_keep")
             block_state.guess_mode = ctrl_state.get("guess_mode")
-            logger.info("MultiDiffusion: ControlNet enabled.")
 
-        # --- Prepare additional conditioning ---
+        # --- Additional conditioning ---
         cond_state = _make_state({
             "original_size": (h, w),
             "target_size": (h, w),
@@ -1239,32 +1341,32 @@ class UltimateSDUpscaleMultiDiffusionStep(ModularPipelineBlocks):
         latent_h, latent_w = latents.shape[-2], latents.shape[-1]
         tile_specs = plan_latent_tiles(latent_h, latent_w, latent_tile_size, latent_overlap)
         num_tiles = len(tile_specs)
-        logger.info(f"MultiDiffusion: {num_tiles} latent tiles ({latent_h}x{latent_w}, tile={latent_tile_size}, overlap={latent_overlap})")
-
-        # --- Configure guidance_scale on guider ---
-        guidance_scale = getattr(block_state, "guidance_scale", 7.5)
-        components.guider.guidance_scale = guidance_scale
+        logger.info(
+            f"MultiDiffusion: {num_tiles} latent tiles "
+            f"({latent_h}x{latent_w}, tile={latent_tile_size}, overlap={latent_overlap})"
+        )
 
         # --- Guider setup ---
+        guidance_scale = getattr(block_state, "guidance_scale", 7.5)
+        components.guider.guidance_scale = guidance_scale
         disable_guidance = True if components.unet.config.time_cond_proj_dim is not None else False
         if disable_guidance:
             components.guider.disable()
         else:
             components.guider.enable()
 
+        # Update block_state with this pass's timestep info
+        block_state.num_inference_steps = num_inf_steps
+
         # --- MultiDiffusion denoise loop ---
-        timesteps = block_state.timesteps
         vae_scale_factor = int(getattr(components, "vae_scale_factor", 8))
         progress_kwargs = getattr(components, "_progress_bar_config", {})
         if not isinstance(progress_kwargs, dict):
             progress_kwargs = {}
 
         for i, t in enumerate(
-            tqdm(timesteps, total=block_state.num_inference_steps, desc="MultiDiffusion", **progress_kwargs)
+            tqdm(timesteps, total=num_inf_steps, desc="MultiDiffusion", **progress_kwargs)
         ):
-            # Accumulators for noise prediction blending
-            # Use float32 accumulators for numerical stability; fp16 can underflow
-            # tiny overlap weights and produce NaNs in normalization.
             noise_pred_accum = torch.zeros_like(latents, dtype=torch.float32)
             weight_accum = torch.zeros(
                 1, 1, latent_h, latent_w,
@@ -1272,10 +1374,8 @@ class UltimateSDUpscaleMultiDiffusionStep(ModularPipelineBlocks):
             )
 
             for tile in tile_specs:
-                # Crop tile from full latents
                 tile_latents = latents[:, :, tile.y:tile.y + tile.h, tile.x:tile.x + tile.w].clone()
 
-                # Crop ControlNet cond for this tile (pixel space)
                 cn_tile = None
                 if use_controlnet and full_controlnet_cond is not None:
                     py = tile.y * vae_scale_factor
@@ -1284,12 +1384,10 @@ class UltimateSDUpscaleMultiDiffusionStep(ModularPipelineBlocks):
                     pw = tile.w * vae_scale_factor
                     cn_tile = full_controlnet_cond[:, :, py:py + ph, px:px + pw]
 
-                # Run UNet (+ ControlNet + guider) on this tile
                 tile_noise_pred = self._run_tile_unet(
                     components, tile_latents, t, i, block_state, cn_tile,
                 )
 
-                # Boundary-aware cosine weight for this tile
                 tile_weight = _make_cosine_tile_weight(
                     tile.h, tile.w, latent_overlap,
                     latents.device, torch.float32,
@@ -1299,18 +1397,15 @@ class UltimateSDUpscaleMultiDiffusionStep(ModularPipelineBlocks):
                     is_right=(tile.x + tile.w >= latent_w),
                 )
 
-                # Accumulate
                 noise_pred_accum[:, :, tile.y:tile.y + tile.h, tile.x:tile.x + tile.w] += (
                     tile_noise_pred.to(torch.float32) * tile_weight
                 )
                 weight_accum[:, :, tile.y:tile.y + tile.h, tile.x:tile.x + tile.w] += tile_weight
 
-            # Normalize (MultiDiffusion weighted average)
             blended_noise_pred = noise_pred_accum / weight_accum.clamp(min=1e-6)
             blended_noise_pred = torch.nan_to_num(blended_noise_pred, nan=0.0, posinf=0.0, neginf=0.0)
             blended_noise_pred = blended_noise_pred.to(latents.dtype)
 
-            # Scheduler step on full latent
             latents_dtype = latents.dtype
             latents = components.scheduler.step(
                 blended_noise_pred, t, latents,
@@ -1328,13 +1423,164 @@ class UltimateSDUpscaleMultiDiffusionStep(ModularPipelineBlocks):
         decoded_images = decode_state.get("images")
         decoded_np = decoded_images[0]
 
-        # Resize if VAE output doesn't exactly match target
         if decoded_np.shape[0] != h or decoded_np.shape[1] != w:
             pil_out = PIL.Image.fromarray((np.clip(decoded_np, 0, 1) * 255).astype(np.uint8))
             pil_out = pil_out.resize((w, h), PIL.Image.LANCZOS)
             decoded_np = np.array(pil_out).astype(np.float32) / 255.0
 
-        # Format output
+        return decoded_np
+
+    @torch.no_grad()
+    def __call__(self, components, state: PipelineState) -> PipelineState:
+        block_state = self.get_block_state(state)
+        t_start = time.time()
+
+        output_type = block_state.output_type
+        latent_tile_size = block_state.latent_tile_size
+        latent_overlap = block_state.latent_overlap
+
+        # --- Feature 5: Scheduler swap ---
+        scheduler_name = getattr(block_state, "scheduler_name", None)
+        if scheduler_name is not None:
+            _swap_scheduler(components, scheduler_name)
+
+        # --- Feature 1 & 2: Progressive upscaling + auto-strength ---
+        upscale_factor = getattr(block_state, "upscale_factor", 2.0)
+        progressive = getattr(block_state, "progressive", True)
+        auto_strength = getattr(block_state, "auto_strength", True)
+        return_metadata = getattr(block_state, "return_metadata", False)
+
+        # Determine if user explicitly set strength (not using default)
+        # The default in InputParam is 0.3; if auto_strength is True we override it.
+        user_strength = block_state.strength
+        # We treat strength=0.3 (the InputParam default) as "not explicitly set" when
+        # auto_strength is enabled. Users who truly want 0.3 can set auto_strength=False.
+
+        # Determine number of progressive passes
+        if progressive and upscale_factor > 2.0:
+            num_passes = max(1, int(math.ceil(math.log2(upscale_factor))))
+        else:
+            num_passes = 1
+
+        # Compute strength per pass
+        strength_per_pass = []
+        for p in range(num_passes):
+            if auto_strength:
+                strength_per_pass.append(
+                    _compute_auto_strength(upscale_factor, p, num_passes)
+                )
+            else:
+                strength_per_pass.append(user_strength)
+
+        # Original input image for progressive mode
+        original_image = getattr(block_state, "image", None)
+        input_w = block_state.upscaled_width
+        input_h = block_state.upscaled_height
+
+        # For tracking the original pre-upscale size
+        if original_image is not None:
+            orig_input_size = (original_image.width, original_image.height)
+        else:
+            # Infer from upscale_factor
+            orig_input_size = (
+                int(round(input_w / upscale_factor)),
+                int(round(input_h / upscale_factor)),
+            )
+
+        # --- ControlNet setup ---
+        control_image_raw = getattr(block_state, "control_image", None)
+        use_controlnet = False
+        if control_image_raw is not None:
+            if isinstance(control_image_raw, list):
+                raise ValueError(
+                    "MultiDiffusion currently supports a single `control_image`, not a list."
+                )
+            if not hasattr(components, "controlnet") or components.controlnet is None:
+                raise ValueError(
+                    "`control_image` was provided but `controlnet` component is missing. "
+                    "Load a ControlNet model into `pipe.controlnet` first."
+                )
+            use_controlnet = True
+            logger.info("MultiDiffusion: ControlNet enabled.")
+
+        if num_passes == 1:
+            # --- Single pass (original behavior) ---
+            block_state._current_pass_strength = strength_per_pass[0]
+
+            ctrl_pil = None
+            if use_controlnet:
+                ctrl_pil = _to_pil_rgb_image(control_image_raw)
+                h, w = block_state.upscaled_height, block_state.upscaled_width
+                if ctrl_pil.size != (w, h):
+                    ctrl_pil = ctrl_pil.resize((w, h), PIL.Image.LANCZOS)
+
+            decoded_np = self._run_single_pass(
+                components, block_state,
+                upscaled_image=block_state.upscaled_image,
+                h=block_state.upscaled_height,
+                w=block_state.upscaled_width,
+                ctrl_pil=ctrl_pil,
+                use_controlnet=use_controlnet,
+                latent_tile_size=latent_tile_size,
+                latent_overlap=latent_overlap,
+            )
+        else:
+            # --- Progressive multi-pass ---
+            # Start from the original (pre-upscale) image
+            if original_image is None:
+                # Fall back to downscaling the upscaled_image back
+                original_image = block_state.upscaled_image.resize(
+                    orig_input_size, PIL.Image.LANCZOS,
+                )
+
+            current_image = original_image
+            per_pass_factor = 2.0
+            current_w, current_h = current_image.width, current_image.height
+
+            for p in range(num_passes):
+                # Compute target size for this pass
+                if p == num_passes - 1:
+                    # Last pass: go to exact target size
+                    target_w = block_state.upscaled_width
+                    target_h = block_state.upscaled_height
+                else:
+                    target_w = int(current_w * per_pass_factor)
+                    target_h = int(current_h * per_pass_factor)
+
+                # Upscale current image to target
+                pass_upscaled = current_image.resize((target_w, target_h), PIL.Image.LANCZOS)
+                block_state._current_pass_strength = strength_per_pass[p]
+
+                # ControlNet: use the current pass input as control image
+                ctrl_pil = None
+                if use_controlnet:
+                    ctrl_pil = pass_upscaled.copy()
+
+                logger.info(
+                    f"Progressive pass {p + 1}/{num_passes}: "
+                    f"{current_w}x{current_h} -> {target_w}x{target_h} "
+                    f"(strength={strength_per_pass[p]:.2f})"
+                )
+
+                decoded_np = self._run_single_pass(
+                    components, block_state,
+                    upscaled_image=pass_upscaled,
+                    h=target_h,
+                    w=target_w,
+                    ctrl_pil=ctrl_pil,
+                    use_controlnet=use_controlnet,
+                    latent_tile_size=latent_tile_size,
+                    latent_overlap=latent_overlap,
+                )
+
+                # Convert decoded to PIL for next pass
+                result_uint8 = (np.clip(decoded_np, 0, 1) * 255).astype(np.uint8)
+                current_image = PIL.Image.fromarray(result_uint8)
+                current_w, current_h = current_image.width, current_image.height
+
+        # --- Format output ---
+        h = block_state.upscaled_height
+        w = block_state.upscaled_width
         result_uint8 = (np.clip(decoded_np, 0, 1) * 255).astype(np.uint8)
         if output_type == "pil":
             block_state.images = [PIL.Image.fromarray(result_uint8)]
@@ -1344,6 +1590,24 @@ class UltimateSDUpscaleMultiDiffusionStep(ModularPipelineBlocks):
             block_state.images = [torch.from_numpy(decoded_np).permute(2, 0, 1).unsqueeze(0)]
         else:
             block_state.images = [PIL.Image.fromarray(result_uint8)]
+
+        # --- Feature 4: Output metadata ---
+        total_time = time.time() - t_start
+        metadata = {
+            "input_size": orig_input_size,
+            "output_size": (w, h),
+            "upscale_factor": upscale_factor,
+            "num_passes": num_passes,
+            "strength_per_pass": strength_per_pass,
+            "total_time": total_time,
+        }
+        block_state.metadata = metadata
+
+        if return_metadata:
+            logger.info(
+                f"MultiDiffusion complete: {orig_input_size} -> ({w}, {h}), "
+                f"{num_passes} pass(es), {total_time:.1f}s"
+            )
 
         self.set_block_state(state, block_state)
         return components, state

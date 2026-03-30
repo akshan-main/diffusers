@@ -18,10 +18,73 @@ import torch
 from ...utils import logging
 from ..modular_pipeline import ModularPipelineBlocks, PipelineState
 from ..modular_pipeline_utils import InputParam, OutputParam
+from ..stable_diffusion_xl.encoders import StableDiffusionXLTextEncoderStep
 from .utils_tiling import plan_seam_fix_bands, plan_tiles_chess, plan_tiles_linear, validate_tile_params
 
 
 logger = logging.get_logger(__name__)
+
+
+class UltimateSDUpscaleTextEncoderStep(StableDiffusionXLTextEncoderStep):
+    """SDXL text encoder step that applies guidance scale before encoding.
+
+    StableDiffusionXLTextEncoderStep decides whether to prepare unconditional
+    embeddings based on `components.guider.num_conditions`. This depends on the
+    current `components.guider.guidance_scale` value.
+
+    In Ultimate SD Upscale, users may call the same pipeline repeatedly with
+    different `guidance_scale` values. Without syncing the guider scale before
+    text encoding, a previous run can leave the guider in a stale state and
+    cause missing negative embeddings on the next run.
+
+    Also applies a sensible default negative prompt for upscaling when the user
+    does not provide one, controlled by ``use_default_negative``.
+    """
+
+    DEFAULT_NEGATIVE_PROMPT = "blurry, low quality, artifacts, noise, jpeg compression"
+
+    @property
+    def inputs(self) -> list[InputParam]:
+        # Keep all SDXL text-encoder inputs and add guidance_scale override.
+        return super().inputs + [
+            InputParam(
+                "guidance_scale",
+                type_hint=float,
+                default=7.5,
+                description=(
+                    "Classifier-Free Guidance scale used to configure the guider "
+                    "before prompt encoding."
+                ),
+            ),
+            InputParam(
+                "use_default_negative",
+                type_hint=bool,
+                default=True,
+                description=(
+                    "When True and negative_prompt is None or empty, apply a default "
+                    "negative prompt optimized for upscaling: "
+                    "'blurry, low quality, artifacts, noise, jpeg compression'."
+                ),
+            ),
+        ]
+
+    @torch.no_grad()
+    def __call__(self, components, state: PipelineState) -> PipelineState:
+        block_state = self.get_block_state(state)
+        guidance_scale = getattr(block_state, "guidance_scale", 7.5)
+
+        if hasattr(components, "guider") and components.guider is not None:
+            components.guider.guidance_scale = guidance_scale
+
+        # Apply default negative prompt if user didn't provide one
+        use_default_negative = getattr(block_state, "use_default_negative", True)
+        if use_default_negative:
+            neg = getattr(block_state, "negative_prompt", None)
+            if neg is None or neg == "":
+                block_state.negative_prompt = self.DEFAULT_NEGATIVE_PROMPT
+                state.set("negative_prompt", self.DEFAULT_NEGATIVE_PROMPT)
+
+        return super().__call__(components, state)
 
 
 class UltimateSDUpscaleUpscaleStep(ModularPipelineBlocks):
