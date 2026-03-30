@@ -1,0 +1,165 @@
+# Copyright 2025 The HuggingFace Team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Top-level block composition for Ultimate SD Upscale.
+
+The pipeline preserves the standard SDXL img2img block graph as closely as
+possible, inserting upscale and tile-plan steps and wrapping the per-tile
+work in a ``LoopSequentialPipelineBlocks``::
+
+    text_encoder → upscale → tile_plan → input → set_timesteps → tiled_img2img
+
+Inside ``tiled_img2img`` (tile loop), each tile runs:
+
+    tile_prepare → tile_denoise → tile_postprocess
+
+Followed by an optional seam-fix pass that re-denoises narrow bands along
+tile boundaries with feathered mask blending.
+
+Features:
+- Linear and chess (checkerboard) tile traversal
+- Non-overlapping core paste or gradient overlap blending
+- Optional seam-fix band re-denoise with configurable width and mask blur
+- Optional ControlNet tile conditioning for stronger cross-tile structure consistency
+- Tile-aware SDXL micro-conditioning (crops_coords_top_left per tile)
+"""
+
+from ...utils import logging
+from ..modular_pipeline import SequentialPipelineBlocks
+from ..modular_pipeline_utils import OutputParam
+from ..stable_diffusion_xl.before_denoise import (
+    StableDiffusionXLImg2ImgSetTimestepsStep,
+    StableDiffusionXLInputStep,
+)
+from .denoise import UltimateSDUpscaleMultiDiffusionStep, UltimateSDUpscaleTileLoopStep
+from .input import UltimateSDUpscaleTextEncoderStep, UltimateSDUpscaleTilePlanStep, UltimateSDUpscaleUpscaleStep
+
+
+logger = logging.get_logger(__name__)
+
+
+class UltimateSDUpscaleBlocks(SequentialPipelineBlocks):
+    """Modular pipeline blocks for Ultimate SD Upscale (SDXL).
+
+    Block graph::
+
+        [0] text_encoder   – StableDiffusionXLTextEncoderStep (reused)
+        [1] upscale        – UltimateSDUpscaleUpscaleStep (new)
+        [2] tile_plan      – UltimateSDUpscaleTilePlanStep (new)
+        [3] input          – StableDiffusionXLInputStep (reused)
+        [4] set_timesteps  – StableDiffusionXLImg2ImgSetTimestepsStep (reused)
+        [5] tiled_img2img  – UltimateSDUpscaleTileLoopStep (tile loop + seam fix)
+
+    Features:
+        - Linear and chess (checkerboard) tile traversal
+        - Non-overlapping core paste or gradient overlap blending
+        - Seam-fix band re-denoise with feathered mask blending
+        - Tile-aware SDXL conditioning (crops_coords_top_left per tile)
+    """
+
+    block_classes = [
+        UltimateSDUpscaleTextEncoderStep,
+        UltimateSDUpscaleUpscaleStep,
+        UltimateSDUpscaleTilePlanStep,
+        StableDiffusionXLInputStep,
+        StableDiffusionXLImg2ImgSetTimestepsStep,
+        UltimateSDUpscaleTileLoopStep,
+    ]
+    block_names = [
+        "text_encoder",
+        "upscale",
+        "tile_plan",
+        "input",
+        "set_timesteps",
+        "tiled_img2img",
+    ]
+
+    _workflow_map = {
+        "upscale": {"image": True, "prompt": True},
+        "upscale_controlnet": {"image": True, "control_image": True, "prompt": True},
+    }
+
+    @property
+    def description(self):
+        return (
+            "Modular pipeline for Ultimate SD Upscale using Stable Diffusion XL.\n"
+            "Upscales an input image and refines it using img2img denoising.\n"
+            "Default: single-pass mode (tile_size=2048) — seamless, no tile artifacts.\n"
+            "For very large images: set tile_size=512 for tiled mode with optional "
+            "chess traversal, gradient blending, seam-fix, and ControlNet tile conditioning."
+        )
+
+    @property
+    def outputs(self):
+        return [OutputParam.template("images")]
+
+
+class MultiDiffusionUpscaleBlocks(SequentialPipelineBlocks):
+    """Modular pipeline blocks for Ultimate SD Upscale with MultiDiffusion (SDXL).
+
+    Uses latent-space noise prediction blending across overlapping tiles for
+    **seamless** tiled upscaling at any resolution. This is the recommended
+    block set for high-quality upscaling.
+
+    Block graph::
+
+        [0] text_encoder     – StableDiffusionXLTextEncoderStep (reused)
+        [1] upscale          – UltimateSDUpscaleUpscaleStep (Lanczos resize)
+        [2] input            – StableDiffusionXLInputStep (reused)
+        [3] set_timesteps    – StableDiffusionXLImg2ImgSetTimestepsStep (reused)
+        [4] multidiffusion   – UltimateSDUpscaleMultiDiffusionStep (NEW)
+
+    The MultiDiffusion step handles VAE encode, tiled denoise with blending,
+    and VAE decode internally, using VAE tiling for memory efficiency.
+
+    Features:
+        - Seamless output at any resolution (no tile boundary artifacts)
+        - Optional ControlNet Tile conditioning
+        - Configurable latent tile size and overlap
+        - Single-pass for small images, tiled for large images
+    """
+
+    block_classes = [
+        UltimateSDUpscaleTextEncoderStep,
+        UltimateSDUpscaleUpscaleStep,
+        StableDiffusionXLInputStep,
+        StableDiffusionXLImg2ImgSetTimestepsStep,
+        UltimateSDUpscaleMultiDiffusionStep,
+    ]
+    block_names = [
+        "text_encoder",
+        "upscale",
+        "input",
+        "set_timesteps",
+        "multidiffusion",
+    ]
+
+    _workflow_map = {
+        "upscale": {"image": True, "prompt": True},
+        "upscale_controlnet": {"image": True, "control_image": True, "prompt": True},
+    }
+
+    @property
+    def description(self):
+        return (
+            "MultiDiffusion upscale pipeline for Stable Diffusion XL.\n"
+            "Upscales an input image and refines it using tiled denoising with "
+            "latent-space noise prediction blending. Produces seamless output at "
+            "any resolution without tile-boundary artifacts.\n"
+            "Supports optional ControlNet Tile conditioning for improved fidelity."
+        )
+
+    @property
+    def outputs(self):
+        return [OutputParam.template("images")]

@@ -92,6 +92,10 @@ else:
         "ZImageAutoBlocks",
         "ZImageModularPipeline",
     ]
+    _import_structure["ultimate_sd_upscale"] = [
+        "UltimateSDUpscaleBlocks",
+        "UltimateSDUpscaleModularPipeline",
+    ]
     _import_structure["components_manager"] = ["ComponentsManager"]
 
 if TYPE_CHECKING or DIFFUSERS_SLOW_IMPORT:
@@ -141,6 +145,7 @@ if TYPE_CHECKING or DIFFUSERS_SLOW_IMPORT:
             QwenImageModularPipeline,
         )
         from .stable_diffusion_xl import StableDiffusionXLAutoBlocks, StableDiffusionXLModularPipeline
+        from .ultimate_sd_upscale import UltimateSDUpscaleBlocks, UltimateSDUpscaleModularPipeline
         from .wan import (
             Wan22Blocks,
             Wan22Image2VideoBlocks,
