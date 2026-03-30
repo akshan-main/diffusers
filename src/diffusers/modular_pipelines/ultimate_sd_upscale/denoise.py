@@ -1038,20 +1038,26 @@ class UltimateSDUpscaleMultiDiffusionStep(ModularPipelineBlocks):
         # Scale input
         scaled_latents = components.scheduler.scale_model_input(tile_latents, t)
 
-        # Guider inputs
+        # Guider inputs — ensure negative embeddings are never None so the
+        # unconditional CFG batch gets valid tensors for UNet + ControlNet.
+        pos_prompt = getattr(block_state, "prompt_embeds", None)
+        neg_prompt = getattr(block_state, "negative_prompt_embeds", None)
+        pos_pooled = getattr(block_state, "pooled_prompt_embeds", None)
+        neg_pooled = getattr(block_state, "negative_pooled_prompt_embeds", None)
+        pos_time_ids = getattr(block_state, "add_time_ids", None)
+        neg_time_ids = getattr(block_state, "negative_add_time_ids", None)
+
+        if neg_prompt is None and pos_prompt is not None:
+            neg_prompt = torch.zeros_like(pos_prompt)
+        if neg_pooled is None and pos_pooled is not None:
+            neg_pooled = torch.zeros_like(pos_pooled)
+        if neg_time_ids is None and pos_time_ids is not None:
+            neg_time_ids = pos_time_ids.clone()
+
         guider_inputs = {
-            "prompt_embeds": (
-                getattr(block_state, "prompt_embeds", None),
-                getattr(block_state, "negative_prompt_embeds", None),
-            ),
-            "time_ids": (
-                getattr(block_state, "add_time_ids", None),
-                getattr(block_state, "negative_add_time_ids", None),
-            ),
-            "text_embeds": (
-                getattr(block_state, "pooled_prompt_embeds", None),
-                getattr(block_state, "negative_pooled_prompt_embeds", None),
-            ),
+            "prompt_embeds": (pos_prompt, neg_prompt),
+            "time_ids": (pos_time_ids, neg_time_ids),
+            "text_embeds": (pos_pooled, neg_pooled),
         }
 
         components.guider.set_state(
