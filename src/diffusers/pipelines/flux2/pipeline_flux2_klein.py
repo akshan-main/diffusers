@@ -825,6 +825,8 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         # We set the index here to remove DtoH sync, helpful especially during compilation.
         # Check out more details here: https://github.com/huggingface/diffusers/pull/11696
         self.scheduler.set_begin_index(0)
+        # Cache transformer.dtype outside the loop to avoid a named_parameters() walk every step.
+        transformer_dtype = self.transformer.dtype
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 if self.interrupt:
@@ -834,11 +836,11 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
                 # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
                 timestep = t.expand(latents.shape[0]).to(latents.dtype)
 
-                latent_model_input = latents.to(self.transformer.dtype)
+                latent_model_input = latents.to(transformer_dtype)
                 latent_image_ids = latent_ids
 
                 if image_latents is not None:
-                    latent_model_input = torch.cat([latents, image_latents], dim=1).to(self.transformer.dtype)
+                    latent_model_input = torch.cat([latents, image_latents], dim=1).to(transformer_dtype)
                     latent_image_ids = torch.cat([latent_ids, image_latent_ids], dim=1)
 
                 with self.transformer.cache_context("cond"):
