@@ -88,7 +88,7 @@ class AsymmetricAutoencoderKLTesterConfig(BaseModelTesterConfig):
 
 
 class TestAsymmetricAutoencoderKL(AsymmetricAutoencoderKLTesterConfig, ModelTesterMixin):
-    base_precision = 1e-2
+    pass
 
 
 class TestAsymmetricAutoencoderKLTraining(AsymmetricAutoencoderKLTesterConfig, TrainingTesterMixin):

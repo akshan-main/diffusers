@@ -86,11 +86,7 @@ class AutoencoderKLLTXVideo090TesterConfig(BaseModelTesterConfig):
 
 
 class TestAutoencoderKLLTXVideo090(AutoencoderKLLTXVideo090TesterConfig, ModelTesterMixin):
-    base_precision = 1e-2
-
-    @pytest.mark.skip("Unsupported test.")
-    def test_outputs_equivalence(self):
-        super().test_outputs_equivalence()
+    pass
 
 
 class TestAutoencoderKLLTXVideo090Training(AutoencoderKLLTXVideo090TesterConfig, TrainingTesterMixin):
@@ -163,11 +159,7 @@ class AutoencoderKLLTXVideo091TesterConfig(BaseModelTesterConfig):
 
 
 class TestAutoencoderKLLTXVideo091(AutoencoderKLLTXVideo091TesterConfig, ModelTesterMixin):
-    base_precision = 1e-2
-
-    @pytest.mark.skip("Unsupported test.")
-    def test_outputs_equivalence(self):
-        super().test_outputs_equivalence()
+    pass
 
 
 class TestAutoencoderKLLTXVideo091Training(AutoencoderKLLTXVideo091TesterConfig, TrainingTesterMixin):
