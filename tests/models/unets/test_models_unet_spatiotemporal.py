@@ -46,7 +46,7 @@ class UNetSpatioTemporalConditionModelTesterConfig(BaseModelTesterConfig):
 
     @property
     def output_shape(self) -> tuple:
-        return (4, 32, 32)
+        return (2, 4, 32, 32)
 
     @property
     def generator(self):
