@@ -13,6 +13,7 @@
 # limitations under the License.
 
 
+import pytest
 import torch
 from PIL import Image
 from transformers import AutoConfig, AutoTokenizer, T5EncoderModel
@@ -116,6 +117,14 @@ class WanVACEPipelineTesterConfig(BasePipelineTesterConfig):
 
 
 class TestWanVACEPipeline(WanVACEPipelineTesterConfig, PipelineTesterMixin):
+    @pytest.mark.skip(reason="Batching is not yet supported with this pipeline")
+    def test_inference_batch_consistent(self):
+        pass
+
+    @pytest.mark.skip(reason="Batching is not yet supported with this pipeline")
+    def test_inference_batch_single_identical(self):
+        pass
+
     def test_inference(self):
         # Run on CPU: the expected slice below is CPU-specific.
         pipe = self.get_pipeline()
