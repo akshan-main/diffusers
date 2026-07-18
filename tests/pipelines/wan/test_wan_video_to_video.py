@@ -20,11 +20,7 @@ from transformers import AutoConfig, AutoTokenizer, T5EncoderModel
 
 from diffusers import AutoencoderKLWan, UniPCMultistepScheduler, WanTransformer3DModel, WanVideoToVideoPipeline
 
-from ..testing_utils import (
-    BasePipelineTesterConfig,
-    MemoryTesterMixin,
-    PipelineTesterMixin,
-)
+from ..testing_utils import BasePipelineTesterConfig, MemoryTesterMixin, PipelineTesterMixin
 
 
 class WanVideoToVideoPipelineTesterConfig(BasePipelineTesterConfig):
