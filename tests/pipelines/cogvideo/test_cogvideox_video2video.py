@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import inspect
-import unittest
 
 import numpy as np
 import torch
@@ -22,36 +21,26 @@ from transformers import AutoConfig, AutoTokenizer, T5EncoderModel
 
 from diffusers import AutoencoderKLCogVideoX, CogVideoXTransformer3DModel, CogVideoXVideoToVideoPipeline, DDIMScheduler
 
-from ...testing_utils import enable_full_determinism, torch_device
-from ..pipeline_params import TEXT_TO_IMAGE_BATCH_PARAMS, TEXT_TO_IMAGE_IMAGE_PARAMS, TEXT_TO_IMAGE_PARAMS
-from ..test_pipelines_common import (
+from ...testing_utils import torch_device
+from ..testing_utils import (
+    BasePipelineTesterConfig,
+    MemoryTesterMixin,
     PipelineTesterMixin,
     check_qkv_fusion_matches_attn_procs_length,
     check_qkv_fusion_processors_exist,
-    to_np,
 )
 
 
-enable_full_determinism()
-
-
-class CogVideoXVideoToVideoPipelineFastTests(PipelineTesterMixin, unittest.TestCase):
+class CogVideoXVideoToVideoPipelineTesterConfig(BasePipelineTesterConfig):
     pipeline_class = CogVideoXVideoToVideoPipeline
-    params = TEXT_TO_IMAGE_PARAMS - {"cross_attention_kwargs"}
-    batch_params = TEXT_TO_IMAGE_BATCH_PARAMS.union({"video"})
-    image_params = TEXT_TO_IMAGE_IMAGE_PARAMS
-    image_latents_params = TEXT_TO_IMAGE_IMAGE_PARAMS
-    required_optional_params = frozenset(
-        [
-            "num_inference_steps",
-            "generator",
-            "latents",
-            "return_dict",
-            "callback_on_step_end",
-            "callback_on_step_end_tensor_inputs",
-        ]
+    required_input_params_in_call_signature = frozenset(
+        ["prompt", "negative_prompt", "height", "width", "guidance_scale", "prompt_embeds", "negative_prompt_embeds"]
     )
-    test_xformers_attention = False
+    batch_input_params = frozenset(["prompt", "video"])
+    # CogVideoX is a video pipeline: it exposes `num_videos_per_prompt`, not the base default `num_images_per_prompt`.
+    optional_input_params = frozenset(
+        ["num_inference_steps", "num_videos_per_prompt", "generator", "latents", "output_type", "return_dict"]
+    )
 
     def get_dummy_components(self):
         torch.manual_seed(0)
@@ -112,21 +101,16 @@ class CogVideoXVideoToVideoPipelineFastTests(PipelineTesterMixin, unittest.TestC
         }
         return components
 
-    def get_dummy_inputs(self, device, seed: int = 0, num_frames: int = 8):
-        if str(device).startswith("mps"):
-            generator = torch.manual_seed(seed)
-        else:
-            generator = torch.Generator(device=device).manual_seed(seed)
-
+    def get_dummy_inputs(self):
         video_height = 16
         video_width = 16
-        video = [Image.new("RGB", (video_width, video_height))] * num_frames
+        video = [Image.new("RGB", (video_width, video_height))] * 8
 
         inputs = {
             "video": video,
             "prompt": "dance monkey",
             "negative_prompt": "",
-            "generator": generator,
+            "generator": self.get_generator(0),
             "num_inference_steps": 2,
             "strength": 0.5,
             "guidance_scale": 6.0,
@@ -138,22 +122,19 @@ class CogVideoXVideoToVideoPipelineFastTests(PipelineTesterMixin, unittest.TestC
         }
         return inputs
 
+
+class TestCogVideoXVideoToVideoPipeline(CogVideoXVideoToVideoPipelineTesterConfig, PipelineTesterMixin):
     def test_inference(self):
-        device = "cpu"
+        pipe = self.get_pipeline()
 
-        components = self.get_dummy_components()
-        pipe = self.pipeline_class(**components)
-        pipe.to(device)
-        pipe.set_progress_bar_config(disable=None)
-
-        inputs = self.get_dummy_inputs(device)
+        inputs = self.get_dummy_inputs()
         video = pipe(**inputs).frames
         generated_video = video[0]
 
-        self.assertEqual(generated_video.shape, (8, 3, 16, 16))
+        assert generated_video.shape == (8, 3, 16, 16)
         expected_video = torch.randn(8, 3, 16, 16)
         max_diff = np.abs(generated_video - expected_video).max()
-        self.assertLessEqual(max_diff, 1e10)
+        assert max_diff <= 1e10
 
     def test_callback_inputs(self):
         sig = inspect.signature(self.pipeline_class.__call__)
@@ -163,13 +144,9 @@ class CogVideoXVideoToVideoPipelineFastTests(PipelineTesterMixin, unittest.TestC
         if not (has_callback_tensor_inputs and has_callback_step_end):
             return
 
-        components = self.get_dummy_components()
-        pipe = self.pipeline_class(**components)
-        pipe = pipe.to(torch_device)
-        pipe.set_progress_bar_config(disable=None)
-        self.assertTrue(
-            hasattr(pipe, "_callback_tensor_inputs"),
-            f" {self.pipeline_class} should have `_callback_tensor_inputs` that defines a list of tensor variables its callback function can use as inputs",
+        pipe = self.get_pipeline().to(torch_device)
+        assert hasattr(pipe, "_callback_tensor_inputs"), (
+            f" {self.pipeline_class} should have `_callback_tensor_inputs` that defines a list of tensor variables its callback function can use as inputs"
         )
 
         def callback_inputs_subset(pipe, i, t, callback_kwargs):
@@ -191,7 +168,7 @@ class CogVideoXVideoToVideoPipelineFastTests(PipelineTesterMixin, unittest.TestC
 
             return callback_kwargs
 
-        inputs = self.get_dummy_inputs(torch_device)
+        inputs = self.get_dummy_inputs()
 
         # Test passing in a subset
         inputs["callback_on_step_end"] = callback_inputs_subset
@@ -215,42 +192,7 @@ class CogVideoXVideoToVideoPipelineFastTests(PipelineTesterMixin, unittest.TestC
         assert output.abs().sum() < 1e10
 
     def test_inference_batch_single_identical(self):
-        self._test_inference_batch_single_identical(batch_size=3, expected_max_diff=1e-3)
-
-    def test_attention_slicing_forward_pass(
-        self, test_max_difference=True, test_mean_pixel_difference=True, expected_max_diff=1e-3
-    ):
-        if not self.test_attention_slicing:
-            return
-
-        components = self.get_dummy_components()
-        pipe = self.pipeline_class(**components)
-        for component in pipe.components.values():
-            if hasattr(component, "set_default_attn_processor"):
-                component.set_default_attn_processor()
-        pipe.to(torch_device)
-        pipe.set_progress_bar_config(disable=None)
-
-        generator_device = "cpu"
-        inputs = self.get_dummy_inputs(generator_device)
-        output_without_slicing = pipe(**inputs)[0]
-
-        pipe.enable_attention_slicing(slice_size=1)
-        inputs = self.get_dummy_inputs(generator_device)
-        output_with_slicing1 = pipe(**inputs)[0]
-
-        pipe.enable_attention_slicing(slice_size=2)
-        inputs = self.get_dummy_inputs(generator_device)
-        output_with_slicing2 = pipe(**inputs)[0]
-
-        if test_max_difference:
-            max_diff1 = np.abs(to_np(output_with_slicing1) - to_np(output_without_slicing)).max()
-            max_diff2 = np.abs(to_np(output_with_slicing2) - to_np(output_without_slicing)).max()
-            self.assertLess(
-                max(max_diff1, max_diff2),
-                expected_max_diff,
-                "Attention slicing should not affect the inference results",
-            )
+        super().test_inference_batch_single_identical(batch_size=3, expected_max_diff=1e-3)
 
     def test_vae_tiling(self, expected_diff_max: float = 0.2):
         # Since VideoToVideo uses both encoder and decoder tiling, there seems to be much more numerical
@@ -258,15 +200,10 @@ class CogVideoXVideoToVideoPipelineFastTests(PipelineTesterMixin, unittest.TestC
         # TODO(aryan): Look into this more deeply
         expected_diff_max = 0.4
 
-        generator_device = "cpu"
-        components = self.get_dummy_components()
-
-        pipe = self.pipeline_class(**components)
-        pipe.to("cpu")
-        pipe.set_progress_bar_config(disable=None)
+        pipe = self.get_pipeline()
 
         # Without tiling
-        inputs = self.get_dummy_inputs(generator_device)
+        inputs = self.get_dummy_inputs()
         inputs["height"] = inputs["width"] = 128
         output_without_tiling = pipe(**inputs)[0]
 
@@ -277,24 +214,18 @@ class CogVideoXVideoToVideoPipelineFastTests(PipelineTesterMixin, unittest.TestC
             tile_overlap_factor_height=1 / 12,
             tile_overlap_factor_width=1 / 12,
         )
-        inputs = self.get_dummy_inputs(generator_device)
+        inputs = self.get_dummy_inputs()
         inputs["height"] = inputs["width"] = 128
         output_with_tiling = pipe(**inputs)[0]
 
-        self.assertLess(
-            (to_np(output_without_tiling) - to_np(output_with_tiling)).max(),
-            expected_diff_max,
-            "VAE tiling should not affect the inference results",
+        assert (output_without_tiling - output_with_tiling).max() < expected_diff_max, (
+            "VAE tiling should not affect the inference results"
         )
 
     def test_fused_qkv_projections(self):
-        device = "cpu"  # ensure determinism for the device-dependent torch.Generator
-        components = self.get_dummy_components()
-        pipe = self.pipeline_class(**components)
-        pipe = pipe.to(device)
-        pipe.set_progress_bar_config(disable=None)
+        pipe = self.get_pipeline()
 
-        inputs = self.get_dummy_inputs(device)
+        inputs = self.get_dummy_inputs()
         frames = pipe(**inputs).frames  # [B, F, C, H, W]
         original_image_slice = frames[0, -2:, -1, -3:, -3:]
 
@@ -306,12 +237,12 @@ class CogVideoXVideoToVideoPipelineFastTests(PipelineTesterMixin, unittest.TestC
             pipe.transformer, pipe.transformer.original_attn_processors
         ), "Something wrong with the attention processors concerning the fused QKV projections."
 
-        inputs = self.get_dummy_inputs(device)
+        inputs = self.get_dummy_inputs()
         frames = pipe(**inputs).frames
         image_slice_fused = frames[0, -2:, -1, -3:, -3:]
 
         pipe.transformer.unfuse_qkv_projections()
-        inputs = self.get_dummy_inputs(device)
+        inputs = self.get_dummy_inputs()
         frames = pipe(**inputs).frames
         image_slice_disabled = frames[0, -2:, -1, -3:, -3:]
 
@@ -324,3 +255,7 @@ class CogVideoXVideoToVideoPipelineFastTests(PipelineTesterMixin, unittest.TestC
         assert np.allclose(original_image_slice, image_slice_disabled, atol=1e-2, rtol=1e-2), (
             "Original outputs should match when fused QKV projections are disabled."
         )
+
+
+class TestCogVideoXVideoToVideoPipelineMemory(CogVideoXVideoToVideoPipelineTesterConfig, MemoryTesterMixin):
+    pass
