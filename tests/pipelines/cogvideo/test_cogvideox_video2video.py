@@ -125,16 +125,21 @@ class CogVideoXVideoToVideoPipelineTesterConfig(BasePipelineTesterConfig):
 
 class TestCogVideoXVideoToVideoPipeline(CogVideoXVideoToVideoPipelineTesterConfig, PipelineTesterMixin):
     def test_inference(self):
+        # Run on CPU: the expected slice below is CPU-specific.
         pipe = self.get_pipeline()
 
         inputs = self.get_dummy_inputs()
         video = pipe(**inputs).frames
         generated_video = video[0]
-
         assert generated_video.shape == (8, 3, 16, 16)
-        expected_video = torch.randn(8, 3, 16, 16)
-        max_diff = np.abs(generated_video - expected_video).max()
-        assert max_diff <= 1e10
+
+        # fmt: off
+        expected_slice = torch.tensor([0.5644, 0.6029, 0.6017, 0.5937, 0.5991, 0.5907, 0.6141, 0.5340, 0.3184, 0.4219, 0.4406, 0.4330, 0.4692, 0.4547, 0.4562, 0.5092])
+        # fmt: on
+
+        generated_slice = generated_video.flatten()
+        generated_slice = torch.cat([generated_slice[:8], generated_slice[-8:]])
+        assert torch.allclose(generated_slice, expected_slice, atol=1e-3)
 
     def test_callback_inputs(self):
         sig = inspect.signature(self.pipeline_class.__call__)
